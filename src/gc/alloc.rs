@@ -26,4 +26,31 @@ impl Heap {
         self.bytes_allocated += size;
         id
     }
+
+    /// Declares `id` a root. Roots are always retained; an id that is not live
+    /// is ignored by the mark.
+    pub fn add_root(&mut self, id: BlockId) {
+        self.roots.insert(id);
+    }
+
+    pub fn remove_root(&mut self, id: BlockId) {
+        self.roots.remove(&id);
+    }
+
+    /// Adds the edge `from -> to` if both blocks are live and the edge is new.
+    pub fn connect(&mut self, from: BlockId, to: BlockId) {
+        if self.blocks.contains_key(&to)
+            && let Some(block) = self.blocks.get_mut(&from)
+            && !block.refs.contains(&to)
+        {
+            block.refs.push(to);
+        }
+    }
+
+    /// Removes the edge `from -> to`. The target may become garbage.
+    pub fn disconnect(&mut self, from: BlockId, to: BlockId) {
+        if let Some(block) = self.blocks.get_mut(&from) {
+            block.refs.retain(|&target| target != to);
+        }
+    }
 }

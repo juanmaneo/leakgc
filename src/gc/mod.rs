@@ -2,8 +2,13 @@
 //! Valgrind-style reporting. Blocks are bookkeeping records, never real memory.
 
 mod alloc;
+mod collect;
+mod mark;
+mod sweep;
 
 use std::collections::{BTreeMap, BTreeSet};
+
+pub use sweep::{LeakReport, SiteLoss};
 
 pub type BlockId = u64;
 
