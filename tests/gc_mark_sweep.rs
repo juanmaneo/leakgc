@@ -1,6 +1,8 @@
 //! Mark, sweep and collect, exercised through the public API.
 
-use win_games_leak_garbage_collector::gc::{Heap, SiteLoss};
+use std::io;
+
+use win_games_leak_garbage_collector::gc::{Heap, LeakReport, SiteLoss};
 
 fn site(name: &str, blocks: u64, bytes: u64) -> SiteLoss {
     SiteLoss {
@@ -8,6 +10,12 @@ fn site(name: &str, blocks: u64, bytes: u64) -> SiteLoss {
         blocks,
         bytes,
     }
+}
+
+/// Collects without a report writer, which cannot fail.
+fn collect(heap: &mut Heap, free_leaks: bool) -> LeakReport {
+    heap.collect(free_leaks, None::<&mut dyn io::Write>)
+        .expect("collecting without a writer cannot fail")
 }
 
 #[test]
@@ -20,7 +28,7 @@ fn unrooted_cycle_is_lost_and_freed() {
     heap.connect(b, c);
     heap.connect(c, a);
 
-    let report = heap.collect(true);
+    let report = collect(&mut heap, true);
 
     assert_eq!(report.total_lost_blocks, 3);
     assert_eq!(report.total_lost_bytes, 192);
@@ -39,7 +47,7 @@ fn rooted_graph_survives_while_unrooted_garbage_is_lost() {
     heap.connect(root, child);
     let garbage = heap.alloc(&[], "leak", 100);
 
-    let report = heap.collect(true);
+    let report = collect(&mut heap, true);
 
     assert_eq!(report.total_lost_blocks, 1);
     assert_eq!(report.total_lost_bytes, 100);
@@ -55,12 +63,12 @@ fn report_only_collection_keeps_garbage_until_a_freeing_collection() {
     let mut heap = Heap::new();
     heap.alloc(&[], "leak", 64);
 
-    let first = heap.collect(false);
+    let first = collect(&mut heap, false);
     assert_eq!(first.total_lost_blocks, 1);
     assert_eq!(first.retained_bytes, 64);
     assert_eq!(heap.blocks().count(), 1);
 
-    let second = heap.collect(true);
+    let second = collect(&mut heap, true);
     assert_eq!(second.total_lost_blocks, 1);
     assert_eq!(second.total_lost_bytes, 64);
     assert_eq!(second.retained_bytes, 0);
@@ -74,7 +82,7 @@ fn clean_heap_reports_no_loss() {
     let root = heap.alloc(&[], "main", 512);
     heap.add_root(root);
 
-    let report = heap.collect(true);
+    let report = collect(&mut heap, true);
 
     assert_eq!(report.total_lost_blocks, 0);
     assert_eq!(report.total_lost_bytes, 0);
@@ -89,9 +97,9 @@ fn retained_bytes_come_from_the_live_table_not_a_running_total() {
     heap.add_root(root);
     heap.alloc(&[], "garbage", 50);
 
-    heap.collect(true);
-    heap.collect(true);
-    let report = heap.collect(true);
+    collect(&mut heap, true);
+    collect(&mut heap, true);
+    let report = collect(&mut heap, true);
 
     assert_eq!(heap.bytes_allocated(), 150);
     assert_eq!(report.retained_bytes, 100);
@@ -104,7 +112,7 @@ fn marks_and_freed_flags_are_clear_after_every_sweep() {
     heap.add_root(root);
     heap.alloc(&[], "garbage", 8);
 
-    heap.collect(true);
+    collect(&mut heap, true);
 
     assert!(heap.blocks().all(|block| !block.marked && !block.freed));
 }
@@ -119,12 +127,12 @@ fn deep_chain_is_marked_without_recursion() {
     }
 
     heap.add_root(tip);
-    let kept = heap.collect(true);
+    let kept = collect(&mut heap, true);
     assert_eq!(kept.total_lost_blocks, 0);
     assert_eq!(kept.retained_bytes, DEPTH);
 
     heap.remove_root(tip);
-    let lost = heap.collect(true);
+    let lost = collect(&mut heap, true);
     assert_eq!(lost.total_lost_blocks, DEPTH);
     assert_eq!(lost.total_lost_bytes, DEPTH);
     assert_eq!(heap.blocks().count(), 0);
@@ -144,7 +152,7 @@ fn shared_and_cyclic_nodes_are_marked_once_and_retained() {
     heap.connect(right, shared);
     heap.connect(shared, root);
 
-    let report = heap.collect(true);
+    let report = collect(&mut heap, true);
 
     assert_eq!(report.total_lost_blocks, 0);
     assert_eq!(report.retained_bytes, 4);
@@ -156,7 +164,7 @@ fn roots_that_are_not_live_are_ignored_by_the_mark() {
     heap.add_root(42);
     heap.alloc(&[], "leak", 8);
 
-    let report = heap.collect(true);
+    let report = collect(&mut heap, true);
 
     assert_eq!(report.total_lost_blocks, 1);
     assert_eq!(heap.roots().collect::<Vec<_>>(), [42]);
@@ -170,7 +178,7 @@ fn by_site_is_sorted_by_bytes_then_by_site_name() {
     heap.alloc(&[], "a:1", 20);
     heap.alloc(&[], "c:1", 100);
 
-    let report = heap.collect(true);
+    let report = collect(&mut heap, true);
 
     assert_eq!(report.total_lost_blocks, 4);
     assert_eq!(report.total_lost_bytes, 140);

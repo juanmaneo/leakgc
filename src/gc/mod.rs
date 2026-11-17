@@ -4,10 +4,12 @@
 mod alloc;
 mod collect;
 mod mark;
+mod report;
 mod sweep;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+pub use report::render_report;
 pub use sweep::{LeakReport, SiteLoss};
 
 pub type BlockId = u64;

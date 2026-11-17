@@ -59,7 +59,9 @@ fn disconnecting_the_last_edge_orphans_the_target() {
     heap.connect(root, child);
     heap.disconnect(root, child);
 
-    let report = heap.collect(true);
+    let report = heap
+        .collect(true, None::<&mut dyn std::io::Write>)
+        .expect("no writer, no io error");
 
     assert_eq!(report.total_lost_blocks, 1);
     assert!(heap.block(child).is_none());
@@ -75,7 +77,9 @@ fn removing_a_root_orphans_its_subtree() {
     heap.connect(root, child);
     heap.remove_root(root);
 
-    let report = heap.collect(true);
+    let report = heap
+        .collect(true, None::<&mut dyn std::io::Write>)
+        .expect("no writer, no io error");
 
     assert_eq!(report.total_lost_blocks, 2);
     assert_eq!(heap.blocks().count(), 0);
