@@ -22,6 +22,7 @@ Honest scope note: "like a VM" here means the supervisor owns the child's addres
 - **Cosmopolitan Libc** (ISC): its README says `--strace` and `--ftrace` log calls made through its own runtime. It does not intercept syscalls from foreign code, so it cannot help with Wine, games, or prebuilt binaries. **Not verified:** I read the README only, not the source. If you meant a specific Cosmopolitan source file, point me to it and I will check it.
 - **Blink** (`jart/blink`, ISC): an x86-64 user-mode emulator. It runs static and dynamic Linux ELF, sees every `SYSCALL` and every memory access, and logs syscalls with `-s`. It is the closest existing "VM that sees everything, static binaries included". Costs: no GPU passthrough, and the README says `-j` (no JIT) is about 10x slower. It is C, which matters for the Rust-only rule. ISC requires attribution, so it would appear in `ACKNOWLEDGEMENTS`.
 - **Wine's `ntdll.dll`** is present at `/usr/lib/wine/x86_64-windows/ntdll.dll`. Its export table contains `RtlAllocateHeap`, `RtlFreeHeap`, `RtlReAllocateHeap` and `RtlSizeHeap` (checked with `x86_64-w64-mingw32-objdump -p`). The Win32 heap can therefore be identified by name. Hooking it is a separate decision (D1).
+- **relibc** (MIT, Redox OS, Rust): a libc written in Rust, built as a `staticlib`. Its malloc is a vendored `dlmalloc-rs` exposed through its `c_api` feature. The Linux path uses raw syscalls via the `sc` crate and is mainly exercised by its own test suite (`./check.sh --test --host` runs statically linked tests). It is **not** a glibc replacement and Wine will not run on it, so it is a compatibility target for static binaries and a malloc test case, not a production family. It pins `nightly-2026-05-24` in `rust-toolchain.toml`, which we do not have installed. **Not verified:** whether `libc.a` keeps its symbols (`.symtab`) after the build, which decides whether our adapter can find `malloc` without signatures.
 - **Valgrind** is still useful as ground truth. Verified earlier: memcheck reports 64 bytes definitely lost on the dynamic build of a test program, and reports "no leaks are possible" on the static build of the same program. That silent miss is the failure mode this design must never repeat.
 - **Environment:** `ptrace_scope=1` (a parent can trace its own children, which is what the supervisor is). Firejail wraps `wine` (`/usr/local/bin/wine` to `/usr/bin/firejail`). Its seccomp list in the child has not been checked yet (see R6).
 
@@ -94,6 +95,7 @@ Residual risk: a thread can hold an allocator lock inside a function we did not 
 | jemalloc (installed) | unprefixed `malloc` family, `malloc_usable_size`, `mallctl` (not used for tracking) | dynamic, static |
 | tcmalloc (installed) | `malloc` family, `tc_*` (`tc_malloc_size` for usable size) | dynamic |
 | musl | `malloc` family | only if it is installed; otherwise skipped |
+| relibc (Rust libc, dlmalloc-rs) | `malloc`, `free`, `calloc`, `realloc`, `memalign` family from `libc.a` (names to confirm in P0-b) | static only (its supported Linux path); built from source with the pinned nightly |
 | Unknown / custom | none (fail-closed) | any; must show as "not covered" |
 
 Test matrix: each allocator x each link mode x each test program. Each row is checked against Valgrind on the dynamic builds (ground truth). The static builds are checked against the expected leak count written into the test program, because Valgrind is blind there.
@@ -104,7 +106,7 @@ Test matrix: each allocator x each link mode x each test program. Each row is ch
 - **P0-b: feasibility spikes (throwaway, not committed).** Verify, on this machine: (1) a Rust stub can install seccomp and be traced, using only safe crates; (2) int3 probes on mimalloc and glibc fire and return correctly; (3) read the child's writable maps; (4) firejail's seccomp list does not block the tracer's own operations; (5) how many syscalls a Wine process makes per second, to size the trace filter cost.
 - **P1: GC core in Rust.** Port of `ocaml/leakcheck.ml` semantics: interval map, tri-color mark, sweep, Valgrind-style report, over an abstract memory trait so tests need no OS. Differential tests against the OCaml oracle (same random operation traces, same results). 100% coverage gate.
 - **P2: supervisor, observe only.** Stub, seccomp TRACE, process tree, memory map. Logs memory syscalls. Tests: static and dynamic hello-world, multi-threaded, fork.
-- **P3: allocator adapters and probes, report only.** glibc first, then mimalloc, then jemalloc and tcmalloc. Test matrix from section 6.
+- **P3: allocator adapters and probes, report only.** glibc first, then mimalloc, then jemalloc, tcmalloc and relibc. Test matrix from section 6. relibc is a compatibility check: its static test programs must report the same leak counts as the other static builds, and any mismatch is a finding to investigate, not a reason to skip it.
 - **P4: conservative roots and report.** Stop the world, register and stack scanning, mark, Valgrind-style report. Known-leak test programs with expected output.
 - **P5: free injection.** Safe-point logic, depth tracking, injected `free`, quarantine mode (delay frees by one cycle and poison the block, so a wrong free shows up as a clear failure rather than silent corruption). Opt-in `--free`.
 - **P6: Wine integration.** Real Wine first (`/usr/lib/wine`). The Rust port when it is available. The Win32 heap is handled according to D1.
@@ -125,6 +127,8 @@ Gate for every phase: `cargo xtask lint`, `cargo xtask coverage` (files, lines, 
 - **R8 "Any allocator" is limited to families we support.** An unknown allocator is reported as "not covered" and never freed. This is fail-closed, not "works for everything".
 - **R9 Linux only.** E2 depends on Linux ptrace and seccomp. This is fine for Wine. It does not give the FreeBSD or bare-metal personality you mentioned (see D11).
 
+- **R10 relibc is not a real-world allocator.** Its malloc is dlmalloc, which behaves differently from glibc, mimalloc and jemalloc under fragmentation and thread caches. A clean result on relibc says the probes and the shadow heap work. It says nothing about Wine or games. Treat it as a test target only.
+
 ## 9. Decisions needed (nothing below is decided yet)
 
 - **D1 Win32 heap (`RtlAllocateHeap` etc.).** Options: (a) hook the exports in `ntdll`. This is instrumenting Wine, which contradicts the locked rule "never inside wine". (b) Leave it as "not covered" and report it. (c) An explicit opt-in adapter that you enable. **Recommendation: (b)**, because it respects the locked rule. Note that game allocations made through HeapAlloc would then never be freed.
@@ -140,6 +144,9 @@ Gate for every phase: `cargo xtask lint`, `cargo xtask coverage` (files, lines, 
 - **D11 Personality.** The child sees the real Linux kernel (transparent). Emulating a FreeBSD or bare-metal personality would be a separate, much larger project (closer to E1). Confirm that transparent Linux is enough.
 - **D12 Project license.** Needed for `LICENSE` and `ACKNOWLEDGEMENTS`. Blink (ISC) and Cosmopolitan (ISC) only require attribution if their code is used. Valgrind is GPL, so we would take the idea and not the code. Which license do you want?
 
+- **D13 relibc scope.** Test target only (static binaries, compatibility checks, malloc test case) or a supported allocator family with its own adapter? **Recommendation: test target only**, because Wine cannot run on it and its Linux path is a secondary target for its own project.
+- **D14 Toolchain for relibc.** Building relibc needs `nightly-2026-05-24` plus `rust-src`, which we do not have. Installing it via rustup is a change to this machine. Approve before P0-b, or I skip relibc until you say so.
+
 ## 10. Acknowledgements (to be finalised in P8)
 
-Pending. Candidates: Valgrind (leak-kind taxonomy, the idea), Blink and Cosmopolitan Libc (ISC, if any code or design is reused), Boehm-Demers-Weiser conservative GC (conservative-root model), the OCaml runtime (tri-color marking reference), and the authors of any crate we depend on.
+Pending. Candidates: Valgrind (leak-kind taxonomy, the idea), relibc (MIT, if its code or build is used), Blink and Cosmopolitan Libc (ISC, if any code or design is reused), Boehm-Demers-Weiser conservative GC (conservative-root model), the OCaml runtime (tri-color marking reference), and the authors of any crate we depend on.
