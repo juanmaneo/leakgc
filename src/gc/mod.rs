@@ -3,6 +3,7 @@
 
 mod alloc;
 mod collect;
+mod demo;
 mod mark;
 mod report;
 mod sweep;
@@ -10,6 +11,7 @@ mod sweep;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub use alloc::COLLECT_EVERY;
+pub use demo::demo_transcript;
 pub use report::render_report;
 pub use sweep::{LeakReport, SiteLoss};
 
