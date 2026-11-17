@@ -95,7 +95,7 @@ Residual risk: a thread can hold an allocator lock inside a function we did not 
 | jemalloc (installed) | unprefixed `malloc` family, `malloc_usable_size`, `mallctl` (not used for tracking) | dynamic, static |
 | tcmalloc (installed) | `malloc` family, `tc_*` (`tc_malloc_size` for usable size) | dynamic |
 | musl | `malloc` family | only if it is installed; otherwise skipped |
-| relibc (Rust libc, dlmalloc-rs) | `malloc`, `free`, `calloc`, `realloc`, `memalign` family from `libc.a` (names to confirm in P0-b) | static only (its supported Linux path); built from source with the pinned nightly |
+| relibc (Rust libc, dlmalloc-rs) | `malloc`, `free`, `calloc`, `realloc`, `memalign` family from `libc.a` (confirmed in P0-b) | static only; built from source with the pinned nightly. **TEST ONLY (D13).** Never a production family. |
 | Unknown / custom | none (fail-closed) | any; must show as "not covered" |
 
 Test matrix: each allocator x each link mode x each test program. Each row is checked against Valgrind on the dynamic builds (ground truth). The static builds are checked against the expected leak count written into the test program, because Valgrind is blind there.
@@ -114,6 +114,23 @@ Test matrix: each allocator x each link mode x each test program. Each row is ch
 - **P8: LICENSE and ACKNOWLEDGEMENTS.** Written at the end, after the license is chosen (D12) and all third-party code is known.
 
 Gate for every phase: `cargo xtask lint`, `cargo xtask coverage` (files, lines, regions, functions at 100% for `src/**`), and the phase's tests.
+
+## 7a. P0-b results so far (throwaway spikes in `spikes/`, excluded from git)
+
+Relibc (test target only, D13):
+
+- Builds on the pinned `nightly-2026-05-24` with `-Z build-std`. Its Redox-only git dependencies (`gitlab.redox-os.org`) also resolved here.
+- `librelibc.a` exports the malloc family unprefixed (`malloc`, `free`, `calloc`, `realloc`, `memalign`, `posix_memalign`, `aligned_alloc`, `malloc_usable_size`). The symbols survive into the final static binary, so name-based adapters work for it.
+- Syscall view alone is not enough. Three `malloc` calls produced only two `mmap` calls, so the syscall layer sees regions, not objects. Object boundaries must come from entry-point probes.
+- An `int3` probe on relibc's `malloc` and `free` works: 3 mallocs and 1 free are reported with correct sizes, return values, and free argument, and the child exits 0.
+
+Lessons from the spike (now test-authoring rules):
+
+- GCC deletes unused `malloc`/`free` pairs as built-ins. Test programs must use `-fno-builtin` and make the pointers escape, or the probe sees nothing.
+- A probe that restores the wrong bytes silently corrupts code. The spike's first version did this, and only the wrong argument values revealed it. Every probe test must assert the exact sequence of calls and arguments, not just that the child exits.
+- Addresses shift on relink. Adapters must resolve symbols at run time, not hard-code them.
+
+Not done yet in P0-b: glibc and mimalloc probes, the seccomp stub (safe Rust only), `/proc/<pid>/maps` reading, the firejail check, and syscall-rate measurement under Wine.
 
 ## 8. Risks (stated plainly)
 
@@ -144,8 +161,8 @@ Gate for every phase: `cargo xtask lint`, `cargo xtask coverage` (files, lines, 
 - **D11 Personality.** The child sees the real Linux kernel (transparent). Emulating a FreeBSD or bare-metal personality would be a separate, much larger project (closer to E1). Confirm that transparent Linux is enough.
 - **D12 Project license.** Needed for `LICENSE` and `ACKNOWLEDGEMENTS`. Blink (ISC) and Cosmopolitan (ISC) only require attribution if their code is used. Valgrind is GPL, so we would take the idea and not the code. Which license do you want?
 
-- **D13 relibc scope.** Test target only (static binaries, compatibility checks, malloc test case) or a supported allocator family with its own adapter? **Recommendation: test target only**, because Wine cannot run on it and its Linux path is a secondary target for its own project.
-- **D14 Toolchain for relibc.** Building relibc needs `nightly-2026-05-24` plus `rust-src`, which we do not have. Installing it via rustup is a change to this machine. Approve before P0-b, or I skip relibc until you say so.
+- **D13 relibc scope. DECIDED: test target only** (static binaries, compatibility checks, malloc test case). Not a supported allocator family in production.
+- **D14 Toolchain for relibc. APPROVED** with the go-ahead to start P0-b: install `nightly-2026-05-24` with `rust-src` via rustup. Scratch work lives in `/tmp`, outside the repo.
 
 ## 10. Acknowledgements (to be finalised in P8)
 
