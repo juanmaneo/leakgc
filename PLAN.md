@@ -1,6 +1,6 @@
 # leakgc: architecture plan (v2, proposal)
 
-Status: **PROPOSAL, nothing implemented in the product yet.** P0-b spikes are done (section 7a). Open decisions are in section 9. P1 does not start until they are answered.
+Status: **PLAN v3. Product: P1 (GC core) is done; nothing else is implemented yet.** Spikes P0-b (section 7a) and P0-c (section 7b) are done. Open items are in section 9.
 Supersedes the architecture sections of `HANDOVER.md` (left untouched).
 No push. Each phase is its own commit, gated by `cargo xtask lint` and `cargo xtask coverage`.
 Spikes live in `spikes/` (git-excluded, throwaway, not covered by the gate).
@@ -37,9 +37,9 @@ Honest scope note: "like a VM" here means the supervisor owns the child's memory
 | **E1** Emulator (Blink-style) | yes | yes, with adapters | yes | no | roughly 10x or worse | The only literal "VM". Good oracle for hard cases. C dependency. |
 | **E2** Supervisor (seccomp TRACE + ptrace + int3 probes) | yes | yes, with adapters | at memory syscalls and probes only | yes | near native (about 27 µs per trap, see 7a) | Recommended. Verified end to end. Not a VM, and I want to be clear about that. |
 | **E3** Hardware VM (KVM guest with Linux and Wine) | yes | yes, with adapters | yes (EPT / introspection) | no (unless passthrough) | near native CPU | Heavy: needs a guest image. Hard GPU story. |
-| **E4** Rust monitor, native execution, allocation hooks and memory-syscall trap, no instruction interpretation (Blink-style structure, no instruction interpretation) | yes | yes, for identified allocators, same limits as E2 | at allocator entry points and memory syscalls only | yes | near native, plus hook cost (to be measured) | Chosen by the user (D17). Mechanism not yet proven, see P0-c. |
+| **E4** Rust monitor, native execution, allocation hooks and memory-syscall trap, no instruction interpretation (Blink-style structure, no instruction interpretation) | yes | yes, for identified allocators, same limits as E2 | at allocator entry points and memory syscalls only | yes | near native, plus hook cost (to be measured) | Chosen by the user (D17). Validated for single-threaded static glibc in P0-c (7b). Threads, dynamic and stripped binaries are not validated yet. |
 
-**Status (D17): E4 chosen by the user.** E2 remains the fallback if the E4 mechanism fails its spike (P0-c).
+**Status (D17): E4 chosen by the user, validated for the single-threaded static case (P0-c).** E2 remains the fallback if a remaining gate fails (threads, dynamic linking, or self-checking code, see 7b).
 
 ## 4. Recommended architecture (E2)
 
@@ -204,6 +204,41 @@ Mimalloc static: the installed `/usr/lib/libmimalloc.a` (LTO-slim) does not expo
 - A probe that restores the wrong bytes silently corrupts code. The first version did this. Every probe test must assert the exact sequence of calls and arguments, not just that the child exits.
 - Addresses shift on relink. Adapters resolve symbols at run time, not at fixed addresses.
 - Empty rule vector in `seccompiler` means "match any arguments" (verified in the crate's docs and code).
+
+## 7b. P0-c results (E4 mechanism, verified; throwaway spike in `spikes/hook_spike`, excluded from git)
+
+Question: can a safe-Rust tracer hook the allocator inside a running process at its exec-stop, record every call and its returned pointer, and let the process run without stopping it per call?
+
+| Run | Result |
+|---|---|
+| `bare` (no hook), `hook_target` | `sequence ok`, exit 0 |
+| `run` (hook), `hook_target` | `sequence ok`, exit 0. Four allocations from `main` (sizes 16, 100, 1000, 40000) match in order, and their returned pointers equal the target's `keep[]` exactly. Seven other calls (libc init, stdio) are recorded too and must be filtered by call site. |
+| `run` inside `firejail --profile=/etc/firejail/wine.profile` | Same result, exit 0 (addresses differ, as expected). The hook works inside the D15 sandbox. |
+| Overhead, 1M `malloc(64)`+`free` pairs, debug build | bare 10.5 to 11.4 ms, hooked 41 to 58 ms. About 31 to 40 ns added per hooked call. |
+| Overhead, same, release build | bare 10.4 to 11.4 ms, hooked 41 to 42 ms. |
+
+For scale: E2 trapped syscalls cost about 27 µs each (7a). A hooked `malloc` costs roughly 700 to 900 times less. At 1M allocations per second, the hook costs roughly 3 to 4 % CPU. That is a guess from one microbenchmark, not a game measurement.
+
+Mechanism facts, all observed:
+
+- The exec-stop sits inside `execve`'s return path. The kernel writes `rax = 0` after the stop, and the first single-step traps before any user instruction. Without one burned single-step, an injected `syscall` silently does not run (`rip` unchanged, `rax` 0). Injection must burn one step first.
+- Inferior `mmap` (RWX, hint `0x10000000`, within 2 GB of `malloc` at `0x4179a0`) succeeded.
+- The entry patch is a 5-byte `jmp rel32` at `malloc+4`, after `endbr64`, which stays in place. It replaces `test %rdi,%rdi` and `js`. Those two instructions are displaced and re-encoded with iced-x86 `BlockEncoder` at the trampoline address. Entry trampoline 165 bytes, exit stub 62 bytes.
+- Writing trampolines and the patch through `/proc/<pid>/mem` into a `r-x` text page works for a ptrace-attached tracer.
+- The return-side hook works as follows. The entry trampoline saves the caller's return address, stores it in a pending table keyed by the caller's rsp, and replaces it with the exit stub's address. The exit stub writes `rax` (the returned pointer) into the record and jumps back. This gives object identity without any stop.
+- Record ring: `lock xadd` on the head, 2^20 records of 32 bytes (size, caller return address, returned pointer). The ring read at the stop was consistent.
+
+Not validated yet (each is a gate before P3 or the feature that needs it):
+
+1. **Multi-threaded targets.** The pending table is global, so the spike is single-threaded only. A per-thread pending state is needed (R16).
+2. **Other entry points.** `free`, `realloc`, `calloc` and `memalign` are not hooked. glibc's `free` tail-jumps to its own entry (7a), so it needs its own analysis.
+3. **Dynamic and PIE binaries.** The spike uses a static non-PIE binary, so the malloc address is fixed at exec-stop. A dynamic binary's libc is mapped later, so a second install point (after `ld.so` maps libc) is needed. Not built.
+4. **Stripped binaries.** The spike looks up `malloc` in the ELF symbol table. The no-symbol path is not exercised (D7, D21).
+5. **Interaction with seccomp TRACE.** The spike ran without the memory-syscall filter. Combining them is a P2 test.
+6. **Ring wrap.** The 1M loop wrote about 1.0M records, which stays below 2^20, so wrap-around was not exercised. The overflow policy is R21.
+7. **Self-checking code and CET enforcement.** Not tested. `endbr64` is kept, but the patch still changes the function's bytes (R18).
+
+Verdict: **PASS for the single-threaded static glibc case, which is the case P0-c had to decide.** E4 is not refuted, and E2 is not needed yet. Threads and dynamic linking are gates inside P2 and P3, not reasons to switch engines. Reproduce: `cd spikes/hook_spike && cargo build && ./target/debug/hook_spike run ../hook_target/hook_target`.
 
 ## 8. Risks (stated plainly)
 
