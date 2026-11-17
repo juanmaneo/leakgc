@@ -1,4 +1,4 @@
-# leakgc: architecture plan (v2, proposal)
+# leakgc: architecture plan (v3, proposal)
 
 Status: **PLAN v3. Product: P1 (GC core) is done; nothing else is implemented yet.** Spikes P0-b (section 7a) and P0-c (section 7b) are done. Open items are in section 9.
 Supersedes the architecture sections of `HANDOVER.md` (left untouched).
@@ -7,7 +7,7 @@ Spikes live in `spikes/` (git-excluded, throwaway, not covered by the gate).
 
 ## 1. What changed from HANDOVER.md (and from v1)
 
-| Area | Old (HANDOVER) | v2 (this plan) |
+| Area | Old (HANDOVER) | v3 (this plan) |
 |---|---|---|
 | Interposition | LD_PRELOAD / libc malloc | Dropped. Works for static binaries and for allocators that bypass the dynamic linker. |
 | Launcher role | Spawns child | Process supervisor. Owns the child tree's memory syscalls and allocator entry points, and passes everything else through to the kernel. |
@@ -35,23 +35,24 @@ Honest scope note: "like a VM" here means the supervisor owns the child's memory
 | Option | Static binaries | Allocator-agnostic | Sees every memory access | GPU works | Speed | Notes |
 |---|---|---|---|---|---|---|
 | **E1** Emulator (Blink-style) | yes | yes, with adapters | yes | no | roughly 10x or worse | The only literal "VM". Good oracle for hard cases. C dependency. |
-| **E2** Supervisor (seccomp TRACE + ptrace + int3 probes) | yes | yes, with adapters | at memory syscalls and probes only | yes | near native (about 27 µs per trap, see 7a) | Recommended. Verified end to end. Not a VM, and I want to be clear about that. |
+| **E2** Supervisor (seccomp TRACE + ptrace + int3 probes) | yes | yes, with adapters | at memory syscalls and probes only | yes | near native (about 27 µs per trap, see 7a) | Former recommendation, now the fallback (D17). Verified end to end. Not a VM, and I want to be clear about that. |
 | **E3** Hardware VM (KVM guest with Linux and Wine) | yes | yes, with adapters | yes (EPT / introspection) | no (unless passthrough) | near native CPU | Heavy: needs a guest image. Hard GPU story. |
-| **E4** Rust monitor, native execution, allocation hooks and memory-syscall trap, no instruction interpretation (Blink-style structure, no instruction interpretation) | yes | yes, for identified allocators, same limits as E2 | at allocator entry points and memory syscalls only | yes | near native, plus hook cost (to be measured) | Chosen by the user (D17). Validated for single-threaded static glibc in P0-c (7b). Threads, dynamic and stripped binaries are not validated yet. |
+| **E4** Rust monitor, native execution, allocation hooks and memory-syscall trap. No instruction interpretation (Blink-style structure only). | yes | yes, for identified allocators, same limits as E2 | at allocator entry points and memory syscalls only | yes | near native, about 35 ns per hooked call (7b) | Chosen by the user (D17). Validated for single-threaded static glibc in P0-c (7b). Threads, dynamic and stripped binaries are not validated yet. |
 
 **Status (D17): E4 chosen by the user, validated for the single-threaded static case (P0-c).** E2 remains the fallback if a remaining gate fails (threads, dynamic linking, or self-checking code, see 7b).
 
-## 4. Recommended architecture (E2)
+## 4. Recommended architecture (E4)
 
 ```mermaid
 flowchart TD
     U[leakgc wine game.exe] --> F[firejail with wine.profile]
-    F --> S[leakgc supervisor, inside the sandbox]
-    S -->|spawns stub, seizes it| T[stub: installs seccomp, execs target]
-    T --> W[wine, game, static exe]
-    W -->|mmap and other memory syscalls trap| S
-    W -->|everything else runs natively| K[Linux kernel]
-    S -->|int3 probes, maps, stop the world| G[shadow heap, mark, report]
+    F --> S[leakgc monitor, inside the sandbox]
+    S -->|spawns stub, seizes it at exec-stop| T[target process, running natively]
+    S -->|injects mmap, writes entry and exit trampolines| T
+    T -->|malloc hooks append records to a ring| R[ring in target memory]
+    T -->|memory syscalls trap via seccomp| S
+    T -->|everything else runs natively| K[Linux kernel]
+    S -->|stop the world at collection, read ring| G[shadow heap, mark, report]
 ```
 
 If Wine is not sandboxed, the `firejail` box is simply removed. The supervisor then runs at the top level.
@@ -61,18 +62,21 @@ If Wine is not sandboxed, the `firejail` box is simply removed. The supervisor t
 1. **Stub and launch (verified).** The supervisor spawns `leakgc __stub <target> [args]`. The stub builds the seccomp filter (all CStrings and argv are built before the filter is installed), calls `apply_filter`, raises `SIGSTOP`, and then `execv`s the target. The supervisor waits for the stub's group-stop (polling `/proc/<pid>/stat` for state `T`), then calls `PTRACE_SEIZE` with `TRACESECCOMP | TRACEEXEC | TRACECLONE | TRACEFORK | TRACEVFORK | EXITKILL`, and then `SIGCONT`. We do **not** use `PTRACE_TRACEME` (it would have the tracer be the child, and it makes the exec-trace logic harder). Filters survive `execve`.
 2. **Syscall filter.** The spike traps `mmap` only, using `SECCOMP_RET_TRACE`. The P2 plan is to add `munmap`, `mremap`, `mprotect`, `madvise`, `brk`, `clone`, `clone3`, and `execve`. Each addition is measured in P2 against the cost in 7a. Everything not on the list runs natively at full speed.
 3. **Memory map.** `/proc/<pid>/maps` gives the writable regions (the spike reads it and counts `rw` mappings). File-backed `MAP_SHARED`, device (`/dev/dri`, `/dev/nvidia*`) and SysV shm mappings are excluded from the heap and from scanning (R3).
-4. **Probes.** On each process with a recognised allocator, `int3` is written through `/proc/<pid>/mem` at the entry of each family function (malloc, free, calloc, realloc, memalign, usable-size). The probe records the call. The return address gets a second probe to capture the return value. Each thread keeps an in-allocator depth counter (4.3). Probe rules from P0-b: dedupe re-entries by (rsp, return address). Glibc's `free` tail-jumps to its own entry, so entry-only probes over-count. Arm probes at exec-stop (static) or when the library's executable mapping appears (dynamic), not at program entry, or pre-main allocations are missed.
-5. **Shadow heap.** Built only from observed calls: `(family, address, usable_size, thread)`. An interval map, so interior pointers resolve to the containing block. It does not read allocator internals. This is what makes the design allocator-agnostic.
-6. **Stop the world.** `PTRACE_INTERRUPT` (or `SIGSTOP`) on every thread, then `PTRACE_GETREGS`.
+4. **Hooks (E4).** At exec-stop, the monitor injects an `mmap` into the target (RWX, within 2 GB of the allocator) and writes an entry trampoline and an exit stub there. It replaces the first 5 bytes of each hooked allocator entry point (after `endbr64`) with a `jmp rel32` to the entry trampoline. Displaced instructions are re-encoded at the trampoline address with iced-x86 (4.6). The entry trampoline saves the caller's return address in a pending table keyed by the caller's rsp, and replaces it with the exit stub's address. The exit stub writes the returned pointer into the ring record and jumps back. The target never stops per call. Measured: about 35 ns per hooked call (7b). The E2 int3 probes from P0-b (7a) remain only as a per-family fallback (4.6). Their lessons still apply: glibc's `free` tail-jumps to its own entry, so a free hook must dedupe re-entries by (rsp, return address) or it over-counts. Pre-main allocations are real (7a), so hooks must be in place before `main`.
+5. **Shadow heap.** Built only from ring records: `(family, returned address, requested size, call site)`. The usable size comes from the family's adapter, not from the record. An interval map, so interior pointers resolve to the containing block. It does not read allocator internals. The map logic is allocator-agnostic. The hooks are not: each family still needs its entry points (item 9).
+6. **Stop the world.** `PTRACE_INTERRUPT` (or `SIGSTOP`) on every thread, then `PTRACE_GETREGS`. Ring records are read only in this state, so the reader never races a writer. Open: a thread stopped between its `lock xadd` and its record store leaves one slot unwritten. Records need a validity marker written last. The spike's 32-byte record has a spare `pad` field that could hold it (not validated, R22).
 7. **Roots and mark.** Conservative roots: all registers of all threads, all thread stacks, all other writable mappings, excluding known-free blocks. Every word inside a live block's `[start, start+usable)` marks it (interior pointers count). Iterative tri-color worklist, as in the OCaml prototype.
-8. **Sweep.** Unmarked live blocks are candidates. Report mode prints a Valgrind-style summary grouped by call site (the site is the probe's return address, symbolised when possible). Free mode calls the family's `free` inside the child at a safe point (4.3).
+8. **Sweep.** Unmarked live blocks are candidates. Report mode prints a Valgrind-style summary grouped by call site (the site is the hook's return address, symbolised when possible). Free mode calls the family's `free` inside the child at a safe point (4.3).
 9. **Allocator adapters.** A family is a table of symbol names plus a usable-size function. Discovery reads `.dynsym` and `.symtab` of every loaded ELF object. Stripped static binaries have no names, so they are detected but not supported until a signature mode exists (later phase). A recognised family whose entry points cannot be resolved is **fail-closed**: its blocks are never freed.
+10. **Install point.** Verified for static non-PIE glibc at exec-stop (7b). Hooks must be installed again after every `execve`, because a new image has no hooks. Dynamic and PIE binaries map libc later, so they need a second install point after the library's executable mapping appears. Not built. This is the first task of P3.
+11. **Ring and pending table.** The ring is 2^20 records of 32 bytes in target memory, with the head advanced by `lock xadd`. The pending table is keyed by the caller's rsp. In the spike it is global and unsynchronised, so the design is valid only for single-threaded targets until R16 is solved. Ring overflow is R21.
 
 ### 4.2 Why this shape
 
-- Works for static binaries, because it observes the process directly and does not depend on the dynamic linker.
+- Works for static binaries, because it hooks the process directly and does not depend on the dynamic linker. Verified for static non-PIE glibc (7b).
 - Works for Wine and for the Rust port, because it sits below both, at the allocator and syscall boundary. Wine is an argument, not a dependency.
-- Keeps our code safe. Ptrace, seccomp and `/proc` are reached through crates (`nix`, `seccompiler`). Our code contains no `unsafe` (verified). The crates do contain unsafe (R7).
+- Keeps our code safe. Ptrace, seccomp and `/proc` are reached through crates (`nix`, `seccompiler`), and displaced-instruction relocation goes through `iced-x86`. Our code contains no `unsafe` (verified). The crates do contain unsafe (R7).
+- Near native, with no per-call stop. A hooked `malloc` costs about 35 ns (7b). An E2 seccomp trap costs about 27 µs (7a). E2 int3 probes were never timed on their own, and each needs at least two stops per call (entry and return), so the comparison is an estimate.
 
 ### 4.3 Safe point and free injection
 
@@ -80,10 +84,10 @@ A block may only be freed when:
 
 1. Its family is supported, and its entry points resolved.
 2. It is unmarked after a full scan (no word in any root points into it, interior pointers included).
-3. **Every thread has in-allocator depth 0.** Probes tell us when a thread is inside malloc/free, because we saw it enter and have not yet seen it leave. If any thread is busy, the collection is skipped and retried.
+3. **No thread is inside a hooked call.** The pending table shows it: we saw the entry and have not yet seen the exit. If any thread has a pending entry, the collection is skipped and retried.
 4. The freeing happens by injecting a call to the family's `free` into one stopped thread: save registers, set up a scratch return address on a page we own, call, restore. This is the gdb "inferior call" technique.
 
-Residual risk: a thread can hold an allocator lock inside a function we did not probe. See R1.
+Residual risk: a thread can hold an allocator lock inside a function we did not hook. See R1.
 
 ### 4.4 Process lifecycle rules (learned from the P0-b spike)
 
@@ -104,6 +108,38 @@ The real `wine` is a firejail sandbox, and that changes where the supervisor has
 - A plain firejail (no profile) blocks `ptrace` with EPERM in its default seccomp filter. `wine.profile` allows it with `allow-debuggers`. The profile must keep that line.
 
 So the launch becomes: `leakgc wine game.exe` → (configured wrapper) `firejail --profile=/etc/firejail/wine.profile leakgc __supervise wine game.exe`. The wrapper is configuration (D15), and `leakgc` must know it.
+
+### 4.6 Hook mechanics and fallback
+
+Install sequence (static non-PIE, verified in 7b):
+
+1. Stop at exec-stop. Burn one `PTRACE_SINGLESTEP` before any injected syscall. Without it the injected `syscall` silently does not run (`rip` unchanged, `rax` 0).
+2. Inject `mmap` (RWX, hint near the allocator, so a `jmp rel32` can reach the trampoline).
+3. Write the entry trampoline, the exit stub, the ring and the pending table through `/proc/<pid>/mem`.
+4. Write the 5-byte patch last. No thread may execute a half-written trampoline.
+
+Refusal rules. Each rule refuses one entry point, which then stays fail-closed (its blocks are never freed):
+
+- Another branch in the function targets a byte inside the 5 patched bytes (R19).
+- An instruction in the displaced bytes cannot be decoded, or cannot be relocated correctly.
+- The displaced instructions do not cover 5 whole bytes, so the patch would split an instruction or overlap the next function.
+
+Decoding: the monitor decodes instruction lengths and the operands needed to relocate the displaced instructions. It executes nothing and does not interpret what the instructions do. This is the answer to open question (3) in D17.
+
+Free hooks: glibc's `free` tail-jumps to its own entry, so a free hook must dedupe re-entries by (rsp, return address). `realloc`, `calloc` and `memalign` each need their own analysis before they are hooked. Until then their frees, or their allocations, are not seen. A block whose free is not seen looks live and is never freed, so the report must say the family is only partly covered.
+
+Fallback per family: if the hooks cannot be installed, the family uses the E2 int3 probes (7a), or it is reported as not covered.
+
+Process tree (design, not tested): a forked child inherits the hooks and the ring mapping, copy-on-write. Each process is its own tracee. The monitor resets the child's ring head and pending table at its fork-stop, and reads each process's ring separately. Threads share one ring and need per-thread pending state (R16).
+
+### 4.7 What E4 removes compared with E2
+
+- The per-call stops for allocator calls. The target keeps running between hooks.
+- The ptrace round trip for each call. The ring is read at collection time only.
+
+What E4 adds: code patching (R17, R18, R19), instruction relocation, and new races (threads, install points, re-install after `execve` and fork).
+
+Unchanged: memory syscalls still trap through seccomp (D16, D18).
 
 ## 5. Roots and what counts as "reachable"
 
@@ -130,20 +166,21 @@ So the launch becomes: `leakgc wine game.exe` → (configured wrapper) `firejail
 
 Test matrix: each allocator x each link mode x each test program. Each row is checked against Valgrind on the dynamic builds (ground truth). The static builds are checked against the leak count written into the test program, because Valgrind is blind there.
 
-Note for static glibc: small allocations use `brk`, not `mmap`. A syscall-only view would see none of them. Object boundaries must come from entry-point probes (verified in P0-b for relibc, and the probe table in 7a for glibc and mimalloc).
+Note for static glibc: small allocations use `brk`, not `mmap`. A syscall-only view would see none of them. Object boundaries must come from entry-point hooks (E4) or probes (E2). Verified in P0-b for relibc, in the probe table in 7a for glibc and mimalloc, and in 7b for E4 hooks on static glibc.
 
 ## 7. Phases (each its own commit, no push)
 
 - **P0-a (this document).** Done in v2. No LICENSE or acknowledgements, as requested.
+- **P0-c: E4 mechanism spike (throwaway, not committed).** **Done.** Results in 7b. PASS for single-threaded static non-PIE glibc.
 - **P0-b: feasibility spikes (throwaway, not committed).** **Done.** Results in 7a. Spikes covered: stub and seccomp trace (safe Rust), int3 probes (glibc, mimalloc, relibc), `/proc/<pid>/maps`, firejail behaviour (both placements), Wine syscall rate.
-- **P1: GC core in Rust.** Port of `ocaml/leakcheck.ml` semantics: interval map, tri-color mark, sweep, Valgrind-style report, over an abstract memory trait so tests need no OS. Differential tests against the OCaml oracle (same random operation traces, same results). 100% coverage gate.
-- **P2: supervisor, observe only.** Stub, seccomp TRACE (trap set from 4.1), drain rules (4.4), process tree, memory map, `Drop` guard. Logs memory syscalls. Tests: static and dynamic hello-world, multi-threaded, fork, a leftover daemon, supervisor error injected after stub stop (must not hang). Runs inside the wrapper when one is configured (D15).
-- **P3: allocator adapters and probes, report only.** Includes identification of stripped static binaries (D7), which needs its own spike before it is committed to. glibc first, then mimalloc, then jemalloc, tcmalloc and relibc. Test matrix from section 6. relibc is a compatibility check: its static test programs must report the same leak counts as the other static builds, and any mismatch is a finding to investigate, not a reason to skip it.
+- **P1: GC core in Rust. Done** (commits `23e4b77` to `951b685`). Port of `ocaml/leakcheck.ml` semantics: block model, tri-color mark, sweep, Valgrind-style report, pacing, stress tests, and a demo transcript that matches the OCaml oracle byte for byte. Gates pass: `cargo xtask lint`, and `cargo xtask coverage` at 100% for all 9 source files. Known gaps before P2: pacing in `alloc` frees by default, which conflicts with D4, so it must be gated by mode. `Block.freed` is set on a block that is dropped right after, which is harmless but should go.
+- **P2: supervisor, observe only.** Stub, seccomp TRACE (trap set from 4.1), drain rules (4.4), process tree, memory map, `Drop` guard, pacing gated by mode (D4). E4 hooks for static non-PIE single-threaded glibc only (4.6). Multi-threaded targets are refused for hooks and reported as not covered (D5). Logs memory syscalls. Tests: static and dynamic hello-world (the dynamic one runs and is reported as not covered until the second install point exists), multi-threaded (refused, must not hang), fork, a leftover daemon, supervisor error injected after stub stop (must not hang), seccomp TRACE combined with hooks (7b item 5), ring wrap (7b item 6). Runs inside the wrapper when one is configured (D15).
+- **P3: allocator adapters and hooks (E4), report only.** First task: the dynamic and PIE install point (4.1 item 10), because most real programs are dynamic. Then per-thread pending state (R16) before any multi-threaded family is hooked, and the free, realloc, calloc and memalign analysis from 4.6. Then identification of stripped static binaries (D7), which needs its own spike before it is committed to. glibc first, then mimalloc, then jemalloc, tcmalloc and relibc. Test matrix from section 6. relibc is a compatibility check: its static test programs must report the same leak counts as the other static builds, and any mismatch is a finding to investigate, not a reason to skip it.
 - **P4: conservative roots and report.** Stop the world, register and stack scanning, mark, Valgrind-style report. Known-leak test programs with expected output.
-- **P5: free injection.** Safe-point logic, depth tracking, injected `free`, quarantine mode (delay frees by one cycle and poison the block, so a wrong free shows up as a clear failure rather than silent corruption). Opt-in `--free`.
+- **P5: free injection.** Safe-point logic, pending-call tracking, injected `free`, quarantine mode (delay frees by one cycle and poison the block, so a wrong free shows up as a clear failure rather than silent corruption). Opt-in `--free`.
 - **P6: Wine integration.** Real Wine first (`/usr/lib/wine`, through the wrapper from D15). The Rust port when it is available. The Win32 heap is handled according to D1.
 - **P7: CLI and config.** `--report` (default) / `--free`, wrapper configuration, time-based pacing (replaces `collect_every = 64`), verbosity, pid filter.
-- **P8: LICENSE and ACKNOWLEDGEMENTS.** Written at the end, after the license is chosen (D12) and all third-party code is known.
+- **P8: LICENSE and ACKNOWLEDGEMENTS.** Written at the end, after the license is chosen (D12) and all third-party code is known. Waits until every RECOMMENDATION in section 9 is confirmed or dropped. Run a `cargo metadata` license audit first.
 
 Gate for every phase: `cargo xtask lint`, `cargo xtask coverage` (files, lines, regions, functions at 100% for `src/**`), and the phase's tests.
 
@@ -242,46 +279,55 @@ Verdict: **PASS for the single-threaded static glibc case, which is the case P0-
 
 ## 8. Risks (stated plainly)
 
-- **R1 Allocator lock held at a stop.** Freeing with a thread inside an allocator lock can deadlock or corrupt. Mitigation: depth tracking (4.3) and skipping busy collections. Residual risk remains, so free mode stays opt-in until P5 is validated on all families.
+- **R1 Allocator lock held at a stop.** Freeing with a thread inside an allocator lock can deadlock or corrupt. Mitigation: pending-call tracking (4.3) and skipping busy collections. Residual risk remains, so free mode stays opt-in until P5 is validated on all families.
 - **R2 Hidden pointers.** Pointers stored XORed, tagged, compressed or NaN-boxed are invisible to a conservative scan, so they cause false frees. Mitigation: quarantine (P5), report-only default, and the rule "free nothing you cannot see".
 - **R3 Memory the scan does not see.** Pointers held only in the kernel (in-flight I/O, io_uring), in GPU or DMA buffers, or in shared memory. Freeing a block that DMA is writing into corrupts it. Mitigation: exclude device and shm mappings from frees, and report them as "not covered".
-- **R4 Undercounted allocations.** A call path we did not probe means a live block is not in the shadow heap. Safe, because unknown regions are roots, but those blocks are never freed and the report must say so.
-- **R5 Performance.** Every probed malloc is several ptrace stops. Every trapped mmap is about 27 µs (debug). Wine cold start inside the sandbox is about 12.4k traps. Steady state for a real game is still unmeasured. Measure in P3. A later option is trampolines in place of probes (binary patching, more complexity).
+- **R4 Undercounted allocations.** A call path we did not hook means a live block is not in the shadow heap. Safe, because unknown regions are roots, but those blocks are never freed and the report must say so.
+- **R5 Performance.** A hooked malloc costs about 35 ns in one microbenchmark (7b). A trapped memory syscall costs about 27 µs (debug, 7a). Wine cold start inside the sandbox is about 12.4k syscall traps, about 0.33 s before any allocation work. Steady state for a real game is still unmeasured. Measure in P3 on a real workload, not only the 64-byte microbenchmark.
 - **R6 Firejail.** Verified: the sandbox blocks outside tracing (4.5), and its default seccomp blocks `ptrace` unless `allow-debuggers` is set. Mitigation: the supervisor runs inside the sandbox, and the profile must keep `allow-debuggers`.
-- **R7 "Rust must be safe" depends on dependencies.** Our code is unsafe-free (verified). `nix`, `libc`, and `seccompiler` contain unsafe internally (section 7a). Decide whether that is acceptable (D3). `cargo xtask audit` should fail if any of our crates lack `forbid(unsafe_code)`.
+- **R7 "Rust must be safe" depends on dependencies.** Our code is unsafe-free (verified). `nix`, `libc`, and `seccompiler` contain unsafe internally (section 7a). Decide whether that is acceptable (D3). `cargo xtask audit` should fail if any of our crates lack `forbid(unsafe_code)`. The E4 spike adds `iced-x86` and `goblin`, which must go through the same audit before P2 commits them.
 - **R8 "Any allocator" is limited to families we support.** An unknown allocator is reported as "not covered" and never freed. Fail-closed, not "works for everything".
-- **R9 Linux only.** E2 depends on Linux ptrace and seccomp. Fine for Wine. It does not give the FreeBSD or bare-metal personality (D11).
-- **R10 relibc is not a real-world allocator.** Its malloc is dlmalloc, which behaves differently from glibc, mimalloc and jemalloc under fragmentation and thread caches. A clean result says the probes and shadow heap work. It says nothing about Wine or games.
+- **R9 Linux only.** E4 depends on Linux ptrace, seccomp and `/proc/<pid>/mem`. Fine for Wine. It does not give the FreeBSD or bare-metal personality (D11).
+- **R10 relibc is not a real-world allocator.** Its malloc is dlmalloc, which behaves differently from glibc, mimalloc and jemalloc under fragmentation and thread caches. A clean result says the hooks and shadow heap work. It says nothing about Wine or games.
 - **R11 Outside supervision of a sandbox is impossible (new).** Verified EPERM. Any design that supervises from outside a firejail-wrapped Wine fails. Mitigation: 4.5.
 - **R12 Lingering daemons (new).** `wineserver` and similar processes outlive the root. Supervision must drain them (4.4 rule 1), or they are killed or left untraced. Verified in the spike.
 - **R13 Supervisor error leaves a stopped stub (new).** Verified hang. Mitigation: `Drop` guard (4.4 rule 2).
-- **R14 `brk` and `munmap` are not trapped yet (new).** The spike traps `mmap` only. Static glibc small allocations use `brk`, so their region growth is invisible to the trap. Mitigation: read `/proc/<pid>/maps` at each collection, and trap `brk` in P2 if measurements justify it.
+- **R14 `brk` and `munmap` are not trapped yet (new).** The spike traps `mmap` only. Static glibc small allocations use `brk`, so their region growth is invisible to the trap. Mitigation: read `/proc/<pid>/maps` at each collection, and trap `brk` in P2 (D18).
 - **R15 Cold start cost (new).** Each sandboxed Wine run starts a fresh wineserver, so the first seconds carry about 12.4k traps. Measure in P3 whether this matters for the user's workflow.
+- **R16 Threads (new, E4).** The spike's pending table is global and has no synchronisation, so two threads can race on a slot. Mitigation: per-thread pending state. Until it is validated, multi-threaded targets are refused for hooks and their blocks are reported as not covered (D5). Not tested.
+- **R17 Patch race and cross-modifying code (new, E4).** Another thread may execute the bytes being patched. Mitigation: install only while every thread is stopped, and never patch a range another thread may execute. The exec-stop install avoids this case because only one thread exists. Not tested beyond that.
+- **R18 Self-checking code and CET (new, E4).** `endbr64` is kept, but the patch still changes the function's bytes. A program that checksums its own code can behave differently, and the monitor cannot detect that. CET enforcement is not tested. Mitigation: test with a self-checking target before P3. Until then this is a known unknown.
+- **R19 Branches into patched bytes, and relocation (new, E4).** Another branch can target the middle of the 5 patched bytes, which then decode as something else. Displaced instructions with rip-relative operands must be relocated correctly. Mitigation: scan the function for branch targets inside the patched range, and refuse those hooks (4.6). Relocation is tested only for the spike's two instructions.
+- **R20 Per-call cost is real (new, E4).** The 35 ns figure comes from one microbenchmark with 64-byte blocks. An allocation-heavy game pays it on every call, and a locked `xadd` costs more under contention. Mitigation: measure on a real workload in P3 before calling it negligible.
+- **R21 Ring overflow (new, E4).** The ring holds 2^20 records. If the target makes more calls between two drains, old records are overwritten. Mitigation: drain at every collection and count wraps. If the ring wrapped before a drain, that collection is marked incomplete, no block is freed in it, and the report says so. The spike never wrapped the ring (7b item 6).
+- **R22 Half-written ring slots (new, E4).** A thread stopped between its `lock xadd` and its record store leaves one stale slot (4.1 item 6). Mitigation: a validity marker written last. The spike's `pad` field is a candidate. Not tested.
 
-## 9. Decisions needed (nothing below is decided yet)
+## 9. Decisions (status per item)
 
-- **D1 Win32 heap (`RtlAllocateHeap` etc.).** Options: (a) hook the exports in `ntdll`. This instruments Wine, which contradicts the locked rule "never inside wine". (b) Leave it as "not covered" and report it. (c) An explicit opt-in adapter you enable. **Recommendation: (b)**, because it respects the locked rule. Game allocations made through HeapAlloc are then never freed.
-- **D2 Engine.** E2 (recommended) or E1 (literal VM, see D17). Confirm E2. Please say explicitly if you wanted E1 or E3.
-- **D3 GC core language.** The locked decision was OCaml. A Rust supervisor cannot call OCaml without `unsafe` FFI, which violates the Rust rule. Options: (a) keep OCaml as a separate process fed over a pipe (no unsafe, but a second runtime and latency); (b) port the core to Rust and keep OCaml as the executable spec and oracle. **Recommendation: (b)**, with OCaml as the reference for differential tests.
-- **D4 Default mode.** Report-only by default, free only with `--free`. **Recommendation: yes.**
-- **D5 Multi-threaded freeing.** Allow freeing in multi-threaded processes, or only report until P5 is validated? **Recommendation: report-only for multi-threaded processes until validated.**
-- **D6 "Any allocator".** Interpreted as: any family with an adapter, and everything else is reported as not covered. **Recommendation: confirm.**
-- **D7 Static binaries (DECIDED by the user): support all binaries, including stripped ones.** Stripped static binaries have no symbol names, so their allocator entry points must be found another way (for example, byte signatures of known allocator builds, or the entry-point probes from P3 combined with a code scan). This is the hardest part of P3 and is not proven yet. Known limit: no method can guarantee that every unknown allocator is found. The fail-closed rule stays as the fallback. Anything that cannot be identified is reported as "not covered" and is never freed, and the report says so explicitly.
-- **D8 Uncovered memory.** Warn in the report and never free it. **Recommendation: confirm.**
-- **D9 Allocator-agnostic region tracking.** Use all writable memory as conservative roots (recommended). Do not use it for object boundaries. **Recommendation: confirm.**
-- **D10 Process scope.** Which processes in the tree are managed? All, only those with a supported family, or a `--pid` filter. Wineserver should probably be excluded from freeing, but still drained (4.4). **Recommendation: only processes with a supported family, and always drain.**
-- **D11 Personality.** The child sees the real Linux kernel (transparent). FreeBSD or bare-metal personalities would be a separate, much larger project (closer to E1). Confirm that transparent Linux is enough.
+Key: **DECIDED** means chosen by the user. **RECOMMENDATION** means proposed and waiting for confirmation. **SUPERSEDED** means replaced by a later decision. P8 waits until every RECOMMENDATION is confirmed or dropped.
+
+- **D1 Win32 heap (`RtlAllocateHeap` etc.). RECOMMENDATION, not confirmed.** Options: (a) hook the exports in `ntdll`. This instruments Wine, which contradicts the locked rule "never inside wine". (b) Leave it as "not covered" and report it. (c) An explicit opt-in adapter you enable. **Recommendation: (b)**, because it respects the locked rule. Game allocations made through HeapAlloc are then never freed.
+- **D2 Engine. SUPERSEDED by D17 (E4).** E2 is the fallback (section 3). E1 and E3 are not chosen.
+- **D3 GC core language. RECOMMENDATION, not confirmed.** The locked decision was OCaml. A Rust supervisor cannot call OCaml without `unsafe` FFI, which violates the Rust rule. Options: (a) keep OCaml as a separate process fed over a pipe (no unsafe, but a second runtime and latency); (b) port the core to Rust and keep OCaml as the executable spec and oracle. **Recommendation: (b)**, with OCaml as the reference for differential tests. P1 already follows (b).
+- **D4 Default mode. RECOMMENDATION, not confirmed.** Report-only by default, free only with `--free`. **Recommendation: yes.**
+- **D5 Multi-threaded freeing. RECOMMENDATION, not confirmed.** Allow freeing in multi-threaded processes, or only report until P5 is validated? **Recommendation: report-only for multi-threaded processes until validated.**
+- **D6 "Any allocator". RECOMMENDATION, not confirmed.** Interpreted as: any family with an adapter, and everything else is reported as not covered. **Recommendation: confirm.**
+- **D7 Static binaries (DECIDED by the user): support all binaries, including stripped ones.** Stripped static binaries have no symbol names, so their allocator entry points must be found another way (for example, byte signatures of known allocator builds, or the entry-point hooks from P3 combined with a code scan). This is the hardest part of P3 and is not proven yet. Known limit: no method can guarantee that every unknown allocator is found. The fail-closed rule stays as the fallback. Anything that cannot be identified is reported as "not covered" and is never freed, and the report says so explicitly.
+- **D8 Uncovered memory. RECOMMENDATION, not confirmed.** Warn in the report and never free it. **Recommendation: confirm.**
+- **D9 Allocator-agnostic region tracking. RECOMMENDATION, not confirmed.** Use all writable memory as conservative roots (recommended). Do not use it for object boundaries. **Recommendation: confirm.**
+- **D10 Process scope. RECOMMENDATION, not confirmed.** Which processes in the tree are managed? All, only those with a supported family, or a `--pid` filter. Wineserver should probably be excluded from freeing, but still drained (4.4). **Recommendation: only processes with a supported family, and always drain.**
+- **D11 Personality. RECOMMENDATION, not confirmed.** The child sees the real Linux kernel (transparent). FreeBSD or bare-metal personalities would be a separate, much larger project (closer to E1). Confirm that transparent Linux is enough.
 - **D12 Project license.** Needed for `LICENSE` and `ACKNOWLEDGEMENTS`. Blink and Cosmopolitan (both ISC) need attribution only if their code or design is reused. Valgrind is GPL, so we take the idea and never its code, which keeps the project MIT-clean. **DECIDED: MIT** (chosen by the user). The `LICENSE` file and `ACKNOWLEDGEMENTS` are written in P8, after the remaining decisions are closed.
 - **D13 relibc scope. DECIDED: test target only.**
 - **D14 Toolchain for relibc. APPROVED** and used in P0-b (`nightly-2026-05-24`, `rust-src`). Scratch work stays outside the repo.
 - **D15 Where the supervisor runs when Wine is sandboxed (new, verified).** Options: (a) **leakgc runs inside the same firejail profile** as the payload: `firejail --profile=/etc/firejail/wine.profile leakgc __supervise wine game.exe`. Verified end to end. Needs `allow-debuggers` (already in `wine.profile`) and a config entry naming the wrapper. (b) Drop the sandbox and supervise bare Wine. Verified to work, but it loses the isolation the user already has. (c) Keep an outside supervisor. Verified impossible (EPERM). **DECIDED: (a), with `/etc/firejail/wine.profile`.**
-- **D16 Seccomp or pure ptrace (new).** Keep seccomp TRACE for memory syscalls (verified, gives exact region lifetimes at about 27 µs per trap), or drop it and poll `/proc/<pid>/maps` at each collection (no per-mmap cost, but new libraries and regions are found late, and `munmap` is invisible). **Recommendation: keep seccomp for P2**, then decide with P2 measurements on real games. Both need the int3 probes anyway.
-- **D17 Engine (DECIDED by the user): E4.** A transparent process monitor written in Rust that does not interpret instructions. It is not a hypervisor: there is no hardware virtualization and no isolation boundary. The guest runs on the real kernel and sees the real OS, and the monitor passes everything through except memory calls. The guest runs natively, and the monitor intercepts only memory allocation: allocator entry points, plus memory syscalls such as `mmap`, `munmap` and `brk`. Effects: the GPU works and the speed is near native. It is not a VM in Blink's sense, because instructions are not emulated, so a memory access that bypasses the hooked entry points is invisible. Open risks, to be settled by a spike (P0-c) before P1 or P2 depends on it: (1) how hooks are injected, either in-process at exec-stop or from outside with ptrace; (2) how the monitor avoids racing the guest while it patches code; (3) whether decoding instruction lengths at hook sites counts as instruction interpretation (it decodes lengths only, and does not execute anything). E2 is the fallback if the spike fails. The identification problem for stripped and custom-allocator binaries (D7, D21) is unchanged. Future option, not part of E4: page-level tracking of all memory accesses (EPT via KVM, or `mprotect`/`userfaultfd`) would also cover non-allocator accesses, at page granularity, with higher cost and possible timing changes.
-- **D18 Trap set and cost budget (new).** The P2 trap list (section 4.1, item 2) includes `brk`, `munmap`, `mprotect` and `clone*`. Each adds stops. **Recommendation: start with `mmap`, `munmap`, `mremap`, `brk`, `clone`, `clone3`, and `execve`, and measure in P2 on a real game before adding more.**
+- **D16 Seccomp or pure ptrace (new). RECOMMENDATION, not confirmed.** Keep seccomp TRACE for memory syscalls (verified, gives exact region lifetimes at about 27 µs per trap), or drop it and poll `/proc/<pid>/maps` at each collection (no per-mmap cost, but new libraries and regions are found late, and `munmap` is invisible). **Recommendation: keep seccomp for P2**, then decide with P2 measurements on real games. Both need the allocator hooks anyway (E4).
+- **D17 Engine (DECIDED by the user): E4.** A transparent process monitor written in Rust that does not interpret instructions. It is not a hypervisor: there is no hardware virtualization and no isolation boundary. The guest runs on the real kernel and sees the real OS, and the monitor passes everything through except memory calls. The guest runs natively, and the monitor intercepts only memory allocation: allocator entry points, plus memory syscalls such as `mmap`, `munmap` and `brk`. Effects: the GPU works and the speed is near native. It is not a VM in Blink's sense, because instructions are not emulated, so a memory access that bypasses the hooked entry points is invisible. Status after P0-c (7b): (1) answered for the single-threaded static case. Hooks are injected in-process at exec-stop, and a dynamic install point is still open (4.1 item 10). (2) Open. The patch race is R17, and nothing is tested beyond exec-stop. (3) Answered by design (4.6). The monitor decodes instruction lengths and relocation operands, and executes nothing. E2 remains the fallback if a remaining gate fails (R16 to R19). The identification problem for stripped and custom-allocator binaries (D7, D21) is unchanged. Future option, not part of E4: page-level tracking of all memory accesses (EPT via KVM, or `mprotect`/`userfaultfd`) would also cover non-allocator accesses, at page granularity, with higher cost and possible timing changes.
+- **D18 Trap set and cost budget (new). RECOMMENDATION, not confirmed.** The P2 trap list (section 4.1, item 2) includes `brk`, `munmap`, `mprotect` and `clone*`. Each adds stops. **Recommendation: start with `mmap`, `munmap`, `mremap`, `brk`, `clone`, `clone3`, and `execve`, and measure in P2 on a real game before adding more.**
 - **D19 Boehm `libgc` (DECIDED, amended after D21): covered in report-only mode.** leakgc observes the `GC_malloc` family and reports leaks like any other family, but never frees a Boehm block. Reason: Boehm already reclaims unreachable memory itself, so freeing its blocks would conflict with its collector. Caveat: leakgc's roots can differ from Boehm's (for example, roots registered with `GC_add_roots`), so a block that Boehm keeps alive may be reported as leaked. Such reports must be labelled as Boehm-managed, not as definitely lost.
-- **D21 Rust custom global allocators (DECIDED by the user): covered.** Any binary is in scope, including Rust programs with a custom `#[global_allocator]` that never calls `malloc`, the same rule as D7. Consequence: to report leaks for such an allocator, its allocation and free entry points must be identified in the binary, which is the D7 identification problem. Region-level tracking (`mmap`, `brk`, `/proc/<pid>/maps`) alone cannot report leaks. This sits badly with the "like a VM" wording, so D17 (E1 emulator or E2 supervisor) must be settled before P3. D17 is still open.
-- **D20 Allocator families in scope (DECIDED).** Support glibc, mimalloc, jemalloc, gperftools tcmalloc (4 variants), oneTBB tbbmalloc (including its malloc proxy), Scudo standalone and musl. relibc is test only (D13). Boehm is detect-and-refuse (D19). LeakSanitizer is oracle only. Priority order for P3: glibc, then mimalloc, then the rest. Caveat: most Windows game memory goes through Wine's heap, which is "not covered" under D1, so these families mainly cover Wine internals and native Linux code.
+- **D21 Rust custom global allocators (DECIDED by the user): covered.** Any binary is in scope, including Rust programs with a custom `#[global_allocator]` that never calls `malloc`, the same rule as D7. Consequence: to report leaks for such an allocator, its allocation and free entry points must be identified in the binary, which is the D7 identification problem. Region-level tracking (`mmap`, `brk`, `/proc/<pid>/maps`) alone cannot report leaks. D17 (E4) is decided. Identifying these allocators is still open and belongs to P3.
+- **D20 Allocator families in scope (DECIDED).** Support glibc, mimalloc, jemalloc, gperftools tcmalloc (4 variants), oneTBB tbbmalloc (including its malloc proxy), Scudo standalone and musl. relibc is test only (D13). Boehm is covered in report-only mode (D19). LeakSanitizer is oracle only. Priority order for P3: glibc, then mimalloc, then the rest. Caveat: most Windows game memory goes through Wine's heap, which is "not covered" under D1, so these families mainly cover Wine internals and native Linux code.
 
 ## 10. Acknowledgements (to be finalised in P8)
 
-Pending, and tied to D12. Candidates: Valgrind (leak-kind taxonomy, the idea), relibc (MIT, if its code or build is used), Blink and Cosmopolitan Libc (ISC, if code or design is reused), Boehm-Demers-Weiser conservative GC (conservative-root model), the OCaml runtime (tri-color marking reference), and the authors of `nix`, `libc`, `seccompiler` and any other crate we depend on.
+Pending, and tied to D12. Candidates: Valgrind (leak-kind taxonomy, the idea), relibc (MIT, if its code or build is used), Blink and Cosmopolitan Libc (ISC, if code or design is reused), Boehm-Demers-Weiser conservative GC (conservative-root model), the OCaml runtime (tri-color marking reference), and the authors of `nix`, `libc`, `seccompiler`, `iced-x86`, `goblin` and any other crate we depend on.
