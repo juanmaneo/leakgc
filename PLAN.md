@@ -242,6 +242,7 @@ Mimalloc static: the installed `/usr/lib/libmimalloc.a` (LTO-slim) does not expo
 - **D16 Seccomp or pure ptrace (new).** Keep seccomp TRACE for memory syscalls (verified, gives exact region lifetimes at about 27 µs per trap), or drop it and poll `/proc/<pid>/maps` at each collection (no per-mmap cost, but new libraries and regions are found late, and `munmap` is invisible). **Recommendation: keep seccomp for P2**, then decide with P2 measurements on real games. Both need the int3 probes anyway.
 - **D17 E1 vs E2 (new, the "like a VM" question).** E2 is a supervisor, not a VM. E1 (Blink-style) is the only literal VM-like option: every instruction and syscall is emulated. Cost: roughly 10x or worse, no GPU, a C dependency, and a patched fork for allocation boundaries. **Recommendation: E2 for the product, with E1 kept as a later oracle.** If you need literal emulation semantics, say so and I will plan E1 instead.
 - **D18 Trap set and cost budget (new).** The P2 trap list (section 4.1, item 2) includes `brk`, `munmap`, `mprotect` and `clone*`. Each adds stops. **Recommendation: start with `mmap`, `munmap`, `mremap`, `brk`, `clone`, `clone3`, and `execve`, and measure in P2 on a real game before adding more.**
+- **D19 Boehm `libgc` (DECIDED).** A process that loads `libgc` is detected, and none of its blocks are freed. They are reported as "not covered". Reason: Boehm is already a garbage collector, so freeing its blocks would conflict with its own collector.
 
 ## 10. Acknowledgements (to be finalised in P8)
 
