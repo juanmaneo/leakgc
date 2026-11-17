@@ -9,6 +9,7 @@ mod sweep;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+pub use alloc::COLLECT_EVERY;
 pub use report::render_report;
 pub use sweep::{LeakReport, SiteLoss};
 
@@ -35,7 +36,9 @@ pub struct Heap {
     roots: BTreeSet<BlockId>,
     next_id: BlockId,
     bytes_allocated: u64,
+    allocs_since_gc: u64,
     collections: u64,
+    pacing_reports: Vec<LeakReport>,
 }
 
 impl Heap {

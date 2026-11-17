@@ -119,14 +119,19 @@ fn marks_and_freed_flags_are_clear_after_every_sweep() {
 
 #[test]
 fn deep_chain_is_marked_without_recursion() {
-    const DEPTH: u64 = 100_000;
+    // Pacing re-marks the growing chain every 64 allocations, so the build is quadratic.
+    const DEPTH: u64 = 20_000;
     let mut heap = Heap::new();
+    // Pacing collects during the build, so the tip is rooted while the chain grows.
     let mut tip = heap.alloc(&[], "chain", 1);
+    heap.add_root(tip);
     for _ in 1..DEPTH {
-        tip = heap.alloc(&[tip], "chain", 1);
+        let next = heap.alloc(&[tip], "chain", 1);
+        heap.add_root(next);
+        heap.remove_root(tip);
+        tip = next;
     }
 
-    heap.add_root(tip);
     let kept = collect(&mut heap, true);
     assert_eq!(kept.total_lost_blocks, 0);
     assert_eq!(kept.retained_bytes, DEPTH);
