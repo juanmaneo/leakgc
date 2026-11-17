@@ -11,21 +11,13 @@
 //! process exit.
 
 use std::ffi::OsString;
+use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus};
 
-#[cfg(unix)]
 fn exit_code(status: ExitStatus) -> i32 {
-    use std::os::unix::process::ExitStatusExt;
-
     status
         .code()
-        .or_else(|| status.signal().map(|signal| 128 + signal))
-        .unwrap_or(1)
-}
-
-#[cfg(not(unix))]
-fn exit_code(status: ExitStatus) -> i32 {
-    status.code().unwrap_or(1)
+        .unwrap_or_else(|| status.signal().map_or(1, |signal| 128 + signal))
 }
 
 fn main() {
