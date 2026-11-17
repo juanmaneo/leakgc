@@ -10,10 +10,26 @@
 //! leaks get freed at runtime instead of merely being contained until
 //! process exit.
 
-use std::process::Command;
+use std::ffi::OsString;
+use std::process::{Command, ExitStatus};
+
+#[cfg(unix)]
+fn exit_code(status: ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+
+    status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .unwrap_or(1)
+}
+
+#[cfg(not(unix))]
+fn exit_code(status: ExitStatus) -> i32 {
+    status.code().unwrap_or(1)
+}
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     if args.is_empty() {
         eprintln!("usage: leakgc <command> [args...]");
         eprintln!("example: leakgc wine game.exe");
@@ -26,11 +42,11 @@ fn main() {
         .args(rest)
         .status()
         .unwrap_or_else(|e| {
-            eprintln!("leakgc: failed to spawn {program}: {e}");
+            eprintln!("leakgc: failed to spawn {program:?}: {e}");
             std::process::exit(127); // conventional "command not found"
         });
 
-    // Propagate the child's exit code so scripts can rely on it, exactly
-    // like valgrind does for the supervised program.
-    std::process::exit(status.code().unwrap_or(1));
+    // Preserve ordinary exit codes and use the shell convention for a child
+    // terminated by a signal (128 + signal), so wrappers can inspect status.
+    std::process::exit(exit_code(status));
 }
