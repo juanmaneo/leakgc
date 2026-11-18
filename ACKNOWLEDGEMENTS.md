@@ -15,28 +15,18 @@ Investigated and not used: **Cosmopolitan Libc** (ISC). It does not intercept sy
 
 ## Shipped code
 
-`leakgc` has no runtime dependencies today. The `[dependencies]` table in `Cargo.toml` is empty.
+The shipped binary is built from the following crates. The list comes from `cargo tree --locked -p win-games-leak-garbage-collector --edges normal` and `cargo metadata` on the current `Cargo.lock`.
 
-## Planned runtime dependencies (license checked, added in P2 if used)
+| Crate | Version | License | Kind |
+|---|---|---|---|
+| libc | 0.2.191 | MIT OR Apache-2.0 | runtime |
+| nix | 0.31.4 | MIT | runtime |
+| seccompiler | 0.5.0 | Apache-2.0 OR BSD-3-Clause | runtime |
+| bitflags | 2.13.2 | MIT OR Apache-2.0 | runtime, via nix |
+| cfg-if | 1.0.5 | MIT OR Apache-2.0 | runtime, via nix |
+| cfg_aliases | 0.2.2 | MIT | build-time, via nix |
 
-Only the crates P2 actually uses will stay. This table is a license check, not a commitment.
-
-| Crate | Version | License |
-|---|---|---|
-| nix | 0.31.2 | MIT |
-| libc | 0.2.189 | MIT OR Apache-2.0 |
-| seccompiler | 0.5.0 | Apache-2.0 OR BSD-3-Clause |
-| iced-x86 | 1.22.0 | MIT |
-| goblin | 0.10.7 | MIT |
-| bitflags | 2.13.2 | MIT OR Apache-2.0 |
-| cfg-if | 1.0.5 | MIT OR Apache-2.0 |
-| cfg_aliases | 0.2.2 | MIT |
-| scroll | 0.13.0 | MIT |
-| scroll_derive | 0.13.2 | MIT (build-time, proc macro) |
-| plain | 0.2.3 | MIT/Apache-2.0 |
-| log | 0.4.35 | MIT OR Apache-2.0 |
-| lazy_static | 1.5.1 | MIT OR Apache-2.0 |
-| proc-macro2, quote, syn | 1.0.107, 1.0.47, 3.0.10 | MIT OR Apache-2.0 (build-time, proc macros) |
+The `[dependencies]` table in `Cargo.toml` names `libc`, `nix` (with `process`, `signal` and `ptrace` features only) and `seccompiler`. The crates from the earlier planned list that are not used (iced-x86, goblin, scroll, plain, log, lazy_static) are not in the lock file. `proc-macro2`, `quote` and `syn` are in the lock file, but only through `xtask`, so they are not shipped.
 
 ## Development tools (not shipped)
 

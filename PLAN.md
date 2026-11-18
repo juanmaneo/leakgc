@@ -174,13 +174,14 @@ Note for static glibc: small allocations use `brk`, not `mmap`. A syscall-only v
 - **P0-c: E4 mechanism spike (throwaway, not committed).** **Done.** Results in 7b. PASS for single-threaded static non-PIE glibc.
 - **P0-b: feasibility spikes (throwaway, not committed).** **Done.** Results in 7a. Spikes covered: stub and seccomp trace (safe Rust), int3 probes (glibc, mimalloc, relibc), `/proc/<pid>/maps`, firejail behaviour (both placements), Wine syscall rate.
 - **P1: GC core in Rust. Done** (commits `23e4b77` to `951b685`). Port of `ocaml/leakcheck.ml` semantics: block model, tri-color mark, sweep, Valgrind-style report, pacing, stress tests, and a demo transcript that matches the OCaml oracle byte for byte. Gates pass: `cargo xtask lint`, and `cargo xtask coverage` at 100% for all 9 source files. Known gaps before P2: pacing in `alloc` frees by default, which conflicts with D4, so it must be gated by mode. `Block.freed` is set on a block that is dropped right after, which is harmless but should go.
-- **P2: supervisor, observe only.** Stub, seccomp TRACE (trap set from 4.1), drain rules (4.4), process tree, memory map, `Drop` guard, pacing gated by mode (D4). E4 hooks for static non-PIE single-threaded glibc only (4.6). Multi-threaded targets are refused for hooks and reported as not covered (D5). Logs memory syscalls. Tests: static and dynamic hello-world (the dynamic one runs and is reported as not covered until the second install point exists), multi-threaded (refused, must not hang), fork, a leftover daemon, supervisor error injected after stub stop (must not hang), seccomp TRACE combined with hooks (7b item 5), ring wrap (7b item 6). Runs inside the wrapper when one is configured (D15).
+- **P2a: supervisor and memory-syscall trap. Done** (commit `f45e32f`). Stub, seccomp TRACE on mmap, munmap, mremap, brk, clone, clone3 and execve, drain rules (4.4), `Drop` guard, root exit code. Results in 7c, decisions in D22 to D27. Pacing gated by mode (D4) was done earlier, in `be27f23`.
+- **P2b: E4 hooks for static non-PIE single-threaded glibc only (4.6). Not started, waiting for a go-ahead.** The original P2 wording is kept below as the starting scope. It is not a final slice: some of its items (drain, error injection) are already covered by P2a tests, so P2b will be re-proposed before it starts. Multi-threaded targets are refused for hooks and reported as not covered (D5). Logs memory syscalls. Tests: static and dynamic hello-world (the dynamic one runs and is reported as not covered until the second install point exists), multi-threaded (refused, must not hang), fork, a leftover daemon, supervisor error injected after stub stop (must not hang), seccomp TRACE combined with hooks (7b item 5), ring wrap (7b item 6). Runs inside the wrapper when one is configured (D15).
 - **P3: allocator adapters and hooks (E4), report only.** First task: the dynamic and PIE install point (4.1 item 10), because most real programs are dynamic. Then per-thread pending state (R16) before any multi-threaded family is hooked, and the free, realloc, calloc and memalign analysis from 4.6. Then identification of stripped static binaries (D7), which needs its own spike before it is committed to. glibc first, then mimalloc, then jemalloc, tcmalloc and relibc. Test matrix from section 6. relibc is a compatibility check: its static test programs must report the same leak counts as the other static builds, and any mismatch is a finding to investigate, not a reason to skip it.
 - **P4: conservative roots and report.** Stop the world, register and stack scanning, mark, Valgrind-style report. Known-leak test programs with expected output.
 - **P5: free injection.** Safe-point logic, pending-call tracking, injected `free`, quarantine mode (delay frees by one cycle and poison the block, so a wrong free shows up as a clear failure rather than silent corruption). Opt-in `--free`.
 - **P6: Wine integration.** Real Wine first (`/usr/lib/wine`, through the wrapper from D15). The Rust port when it is available. The Win32 heap is handled according to D1.
 - **P7: CLI and config.** `--report` (default) / `--free`, wrapper configuration, time-based pacing (replaces `collect_every = 64`), verbosity, pid filter.
-- **P8: LICENSE and ACKNOWLEDGEMENTS. Done.** MIT (D12) in `LICENSE`, and `ACKNOWLEDGEMENTS.md` from a `cargo metadata` audit of the current lock file and the spike lock files. The shipped binary still has no runtime dependencies.
+- **P8: LICENSE and ACKNOWLEDGEMENTS. Done.** MIT (D12) in `LICENSE`, and `ACKNOWLEDGEMENTS.md` from a `cargo metadata` audit of the current lock file and the spike lock files. At P8 the shipped binary had no runtime dependencies. P2a added `libc`, `nix` and `seccompiler` (see `ACKNOWLEDGEMENTS.md`).
 
 Gate for every phase: `cargo xtask lint`, `cargo xtask coverage` (files, lines, regions, functions at 100% for `src/**`), and the phase's tests.
 
@@ -277,6 +278,15 @@ Not validated yet (each is a gate before P3 or the feature that needs it):
 
 Verdict: **PASS for the single-threaded static glibc case, which is the case P0-c had to decide.** E4 is not refuted, and E2 is not needed yet. Threads and dynamic linking are gates inside P2 and P3, not reasons to switch engines. Reproduce: `cd spikes/hook_spike && cargo build && ./target/debug/hook_spike run ../hook_target/hook_target`.
 
+## 7c. P2a results (verified, tests in `tests/`)
+
+- **Mechanism.** `leakgc __stub <cmd>` installs a seccomp filter that traps mmap, munmap, mremap, brk, clone, clone3 and execve, then stops itself. The supervisor seizes it, resumes it, and drains until ECHILD. The root exit code is returned. Non-memory syscalls are not trapped, so they run natively.
+- **Observed behaviour (used as test assertions).** A static glibc hello traps execve and brk. A 1 MB malloc in a static binary did not show mmap. A dynamic threaded program traps mmap and clone3. Orphaned grandchildren are still waited for, because forks are auto-attached and stay traced after reparenting. leakgc is not a subreaper.
+- **Tests.** `tests/supervisor_fake.rs` has 17 scripted-tracer tests covering every error arm. `tests/supervisor_real.rs` has 4 real-process tests, with C fixtures in `tests/fixtures/`. `tests/supervisor_seize.rs` has 1 test and stays alone in its file, because waiting on the whole process group would race with other tests. `tests/trap.rs`, `tests/maps.rs` and `tests/stub.rs` cover the rest.
+- **Stub limits.** The stub's success path is covered only by the missing-program run, because execve replaces the process image. A stub started in-process with a valid program raises SIGSTOP, so that path is tested only through the binary.
+- **Gates.** `cargo test --workspace` passed three runs in a row. `cargo xtask lint` passed. `cargo xtask coverage` passed: all 13 `src/` files at 100% functions, lines and regions.
+- **Not covered.** Hooks, dynamic and PIE install points, multi-threaded hooks and stripped binaries are all P2b or P3 work.
+
 ## 8. Risks (stated plainly)
 
 - **R1 Allocator lock held at a stop.** Freeing with a thread inside an allocator lock can deadlock or corrupt. Mitigation: pending-call tracking (4.3) and skipping busy collections. Residual risk remains, so free mode stays opt-in until P5 is validated on all families.
@@ -304,7 +314,7 @@ Verdict: **PASS for the single-threaded static glibc case, which is the case P0-
 
 ## 9. Decisions (status per item)
 
-Key: **DECIDED** means chosen or confirmed by the user. **SUPERSEDED** means replaced by a later decision. Every item is now DECIDED or SUPERSEDED, so P8 is unblocked.
+Key: **DECIDED** means chosen or confirmed by the user. **SUPERSEDED** means replaced by a later decision. Every item is DECIDED or SUPERSEDED, except D28, which is OPEN and needs the user's answer.
 
 - **D1 Win32 heap (`RtlAllocateHeap` etc.). DECIDED (confirmed).** Options: (a) hook the exports in `ntdll`. This instruments Wine, which contradicts the locked rule "never inside wine". (b) Leave it as "not covered" and report it. (c) An explicit opt-in adapter you enable. **Recommendation: (b)**, because it respects the locked rule. Game allocations made through HeapAlloc are then never freed.
 - **D2 Engine. SUPERSEDED by D17 (E4).** E2 is the fallback (section 3). E1 and E3 are not chosen.
@@ -327,6 +337,14 @@ Key: **DECIDED** means chosen or confirmed by the user. **SUPERSEDED** means rep
 - **D19 Boehm `libgc` (DECIDED, amended after D21): covered in report-only mode.** leakgc observes the `GC_malloc` family and reports leaks like any other family, but never frees a Boehm block. Reason: Boehm already reclaims unreachable memory itself, so freeing its blocks would conflict with its collector. Caveat: leakgc's roots can differ from Boehm's (for example, roots registered with `GC_add_roots`), so a block that Boehm keeps alive may be reported as leaked. Such reports must be labelled as Boehm-managed, not as definitely lost.
 - **D21 Rust custom global allocators (DECIDED by the user): covered.** Any binary is in scope, including Rust programs with a custom `#[global_allocator]` that never calls `malloc`, the same rule as D7. Consequence: to report leaks for such an allocator, its allocation and free entry points must be identified in the binary, which is the D7 identification problem. Region-level tracking (`mmap`, `brk`, `/proc/<pid>/maps`) alone cannot report leaks. D17 (E4) is decided. Identifying these allocators is still open and belongs to P3.
 - **D20 Allocator families in scope (DECIDED).** Support glibc, mimalloc, jemalloc, gperftools tcmalloc (4 variants), oneTBB tbbmalloc (including its malloc proxy), Scudo standalone and musl. relibc is test only (D13). Boehm is covered in report-only mode (D19). LeakSanitizer is oracle only. Priority order for P3: glibc, then mimalloc, then the rest. Caveat: most Windows game memory goes through Wine's heap, which is "not covered" under D1, so these families mainly cover Wine internals and native Linux code.
+
+- **D22 Tracer trait as the seam (P2a). DECIDED (implementation; not yet confirmed by the user).** Every OS call in the supervisor goes through the `Tracer` trait. Control flow, including every error arm, is tested with scripted results.
+- **D23 Public event model (P2a). DECIDED (implementation).** `Event` and `classify` are public, so each wait status maps to one event that tests can check directly.
+- **D24 Fail-closed stub (P2a). DECIDED (implementation; rule 4.4.2).** A failed seize or resume kills the stub with SIGKILL, through the `Drop` guard. The stub never stays in group-stop.
+- **D25 `wait_any` errors (P2a). DECIDED (implementation).** EINTR is retried. ECHILD ends the drain. Any other error makes `leakgc` exit with 1.
+- **D26 Trace logging (P2a). DECIDED (implementation).** Trace logging is best-effort. Logging failures are ignored.
+- **D27 Coverage scope (P2a). DECIDED (implementation; open option).** `tests/` is not in the coverage report, because cargo-llvm-cov excludes it by default. The gate covers `src/**` only. Making this explicit in `xtask` is an open option.
+- **D28 Package name. OPEN.** `Cargo.toml` still says `win-games-leak-garbage-collector`. The binary is `leakgc`. Renaming the package to `leakgc` needs the user's answer.
 
 ## 10. Acknowledgements (finalised in P8, see `ACKNOWLEDGEMENTS.md`)
 
