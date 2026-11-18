@@ -24,17 +24,22 @@ The shipped binary is built from the following crates. The list comes from `carg
 | seccompiler | 0.5.0 | Apache-2.0 OR BSD-3-Clause | runtime |
 | bitflags | 2.13.2 | MIT OR Apache-2.0 | runtime, via nix |
 | cfg-if | 1.0.5 | MIT OR Apache-2.0 | runtime, via nix |
-| iced-x86 | 1.22.0 | MIT | runtime (decoder, encoder, block_encoder features only) |
+| iced-x86 | 1.22.0 | MIT | runtime (decoder, encoder, block_encoder and code_asm features only) |
 | lazy_static | 1.5.1 | MIT OR Apache-2.0 | runtime, via iced-x86 |
+| goblin | 0.10.7 | MIT | runtime (elf32, elf64, endian_fd and std features only) |
+| scroll | 0.13.0 | MIT | runtime, via goblin |
+| plain | 0.2.3 | MIT/Apache-2.0 | runtime, via goblin |
+| log | 0.4.35 | MIT OR Apache-2.0 | runtime, via goblin |
+| scroll_derive | 0.13.2 | MIT | build-time only (proc macro), via scroll |
 | cfg_aliases | 0.2.2 | MIT | build-time, via nix |
 
-The `[dependencies]` table in `Cargo.toml` names `libc`, `nix` (with `process`, `signal` and `ptrace` features only), `seccompiler` and `iced-x86` (with `decoder`, `encoder` and `block_encoder` features only). The crates from the earlier planned list that are not used (goblin, scroll, plain, log) are not in the lock file. `proc-macro2`, `quote` and `syn` are in the lock file, but only through `xtask`, so they are not shipped.
+The `[dependencies]` table in `Cargo.toml` names `libc`, `nix` (with `process`, `signal` and `ptrace` features only), `seccompiler`, `iced-x86` (with `decoder`, `encoder`, `block_encoder` and `code_asm` features only) and `goblin` (with `elf32`, `elf64`, `endian_fd` and `std` features only). `scroll_derive` is a proc macro that `scroll` uses at build time, and it brings in `proc-macro2`, `quote`, `syn` and `unicode-ident`. Proc macros run at build time and are not linked into the binary, but they are on the normal dependency graph, so they are listed in the next section, next to the xtask dependencies.
 
 ## Development tools (not shipped)
 
 `xtask` uses `serde_json` and its dependencies: `serde`, `serde_core`, `serde_derive` (MIT OR Apache-2.0), `itoa` (MIT OR Apache-2.0), `memchr` (Unlicense OR MIT), `zmij` (MIT), `proc-macro2`, `quote`, `syn` (MIT OR Apache-2.0), and `unicode-ident` ((MIT OR Apache-2.0) AND Unicode-3.0).
 
-`unicode-ident` ships Unicode data under the Unicode License v3 (SPDX `Unicode-3.0`). That license requires its copyright and permission notice to stay with any redistributed copy of the crate. This repository does not vendor it, so no notice is included here. If the crate is ever vendored or redistributed, its notice must be kept with it.
+`unicode-ident` ships Unicode data under the Unicode License v3 (SPDX `Unicode-3.0`). That license requires its copyright and permission notice to stay with any redistributed copy of the crate. This repository does not vendor it, so no notice is included here. If the crate is ever vendored or redistributed, its notice must be kept with it. It is also a build-time dependency of the shipped build, through `proc-macro2`.
 
 `cargo-llvm-cov`, used by `cargo xtask coverage`, is installed separately and is not part of this repository.
 
