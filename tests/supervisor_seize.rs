@@ -75,6 +75,10 @@ impl Tracer for RefuseSeize {
         self.os.step(pid)
     }
 
+    fn event_message(&mut self, pid: Pid) -> nix::Result<i64> {
+        self.os.event_message(pid)
+    }
+
     fn read_mem(&mut self, pid: Pid, addr: u64, len: usize) -> io::Result<Vec<u8>> {
         self.os.read_mem(pid, addr, len)
     }

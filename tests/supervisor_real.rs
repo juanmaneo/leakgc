@@ -85,6 +85,24 @@ fn threaded_dynamic_binary_runs_to_completion_without_hanging() {
 }
 
 #[test]
+fn static_binary_reports_its_outstanding_blocks_by_caller() {
+    let hooks = build_c("hooks_static.c", &["-static", "-no-pie"]);
+    let path = hooks.to_str().expect("UTF-8 path");
+    let (status, log) = run_leakgc(&[path], &[("LEAKGC_LOG", "1")]);
+
+    assert_eq!(status.code(), Some(0), "log:\n{log}");
+    assert!(
+        log.contains("hooked malloc, free and realloc"),
+        "log:\n{log}"
+    );
+    assert!(log.contains("1 blocks, 200 bytes"), "log:\n{log}");
+    assert!(log.contains("1 blocks, 40000 bytes"), "log:\n{log}");
+    assert!(log.contains("exit code 0"), "log:\n{log}");
+    assert!(!log.contains("not covered"), "log:\n{log}");
+    assert!(!log.contains("unknown frees"), "log:\n{log}");
+}
+
+#[test]
 fn background_jobs_are_waited_for() {
     let (status, _) = run_leakgc(&["sh", "-c", "sleep 0.1 & wait"], &[]);
 

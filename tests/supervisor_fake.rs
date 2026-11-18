@@ -32,6 +32,7 @@ enum Call {
     Kill(i32, Signal),
     SyscallNr(i32),
     ReadMaps(i32),
+    EventMessage(i32),
 }
 
 type Scripted = nix::Result<WaitStatus>;
@@ -45,6 +46,7 @@ struct Fake {
     fail_signal: Option<Signal>,
     syscall_result: nix::Result<i64>,
     maps: Option<&'static str>,
+    events: VecDeque<nix::Result<i64>>,
     calls: Vec<Call>,
 }
 
@@ -59,6 +61,7 @@ impl Fake {
             fail_signal: None,
             syscall_result: Ok(libc::SYS_execve),
             maps: Some(MAPS),
+            events: VecDeque::new(),
             calls: Vec::new(),
         }
     }
@@ -116,7 +119,7 @@ impl Tracer for Fake {
     }
 
     fn exe_image(&mut self, _pid: Pid) -> io::Result<Vec<u8>> {
-        unreachable!("supervision never reads the image")
+        Err(io::Error::other("no image in the scripted tracer"))
     }
 
     fn regs(&mut self, _pid: Pid) -> nix::Result<libc::user_regs_struct> {
@@ -129,6 +132,11 @@ impl Tracer for Fake {
 
     fn step(&mut self, _pid: Pid) -> nix::Result<()> {
         unreachable!("supervision never single-steps")
+    }
+
+    fn event_message(&mut self, pid: Pid) -> nix::Result<i64> {
+        self.calls.push(Call::EventMessage(pid.as_raw()));
+        self.events.pop_front().unwrap_or(Err(Errno::ESRCH))
     }
 
     fn read_mem(&mut self, _pid: Pid, _addr: u64, _len: usize) -> io::Result<Vec<u8>> {
@@ -443,8 +451,20 @@ fn classify_maps_every_wait_status() {
             Signal::SIGTRAP,
             PTRACE_EVENT_EXEC
         )),
-        Event::PtraceStop(pid)
+        Event::Exec(pid)
     );
+    for (event, expected) in [
+        (libc::PTRACE_EVENT_FORK, Event::Fork(pid)),
+        (libc::PTRACE_EVENT_VFORK, Event::Spawn(pid)),
+        (libc::PTRACE_EVENT_CLONE, Event::Spawn(pid)),
+        (99, Event::PtraceStop(pid)),
+    ] {
+        assert_eq!(
+            classify(WaitStatus::PtraceEvent(pid, Signal::SIGTRAP, event)),
+            expected,
+            "event {event}"
+        );
+    }
     assert_eq!(
         classify(WaitStatus::PtraceSyscall(pid)),
         Event::PtraceStop(pid)
@@ -455,4 +475,162 @@ fn classify_maps_every_wait_status() {
     );
     assert_eq!(classify(WaitStatus::Continued(pid)), Event::Ignored);
     assert_eq!(classify(WaitStatus::StillAlive), Event::Ignored);
+}
+
+fn fork_event(pid: i32) -> Scripted {
+    Ok(WaitStatus::PtraceEvent(
+        Pid::from_raw(pid),
+        Signal::SIGTRAP,
+        libc::PTRACE_EVENT_FORK,
+    ))
+}
+
+fn clone_event(pid: i32) -> Scripted {
+    Ok(WaitStatus::PtraceEvent(
+        Pid::from_raw(pid),
+        Signal::SIGTRAP,
+        libc::PTRACE_EVENT_CLONE,
+    ))
+}
+
+#[test]
+fn a_child_stop_after_its_fork_event_is_resumed_when_the_event_names_it() {
+    let mut tracer = Fake::new(
+        vec![stopped(STUB, Signal::SIGSTOP)],
+        vec![
+            fork_event(STUB),
+            stopped(CHILD, Signal::SIGSTOP),
+            exited(STUB, 0),
+        ],
+    );
+    tracer.events.push_back(Ok(i64::from(CHILD)));
+    let (code, _) = run(&mut tracer, false);
+
+    assert_eq!(code, 0);
+    assert_eq!(
+        tracer.calls,
+        [
+            Call::Spawn,
+            Call::WaitStopped(STUB),
+            Call::Seize(STUB),
+            Call::Kill(STUB, Signal::SIGCONT),
+            Call::WaitAny,
+            Call::EventMessage(STUB),
+            Call::Cont(STUB, None),
+            Call::WaitAny,
+            Call::Cont(CHILD, None),
+            Call::WaitAny,
+            Call::WaitAny,
+        ]
+    );
+}
+
+#[test]
+fn a_child_stop_before_its_fork_event_waits_for_the_event() {
+    let mut tracer = Fake::new(
+        vec![stopped(STUB, Signal::SIGSTOP)],
+        vec![
+            stopped(CHILD, Signal::SIGSTOP),
+            fork_event(STUB),
+            exited(STUB, 0),
+        ],
+    );
+    tracer.events.push_back(Ok(i64::from(CHILD)));
+    let (code, _) = run(&mut tracer, false);
+
+    assert_eq!(code, 0);
+    assert_eq!(
+        tracer.calls,
+        [
+            Call::Spawn,
+            Call::WaitStopped(STUB),
+            Call::Seize(STUB),
+            Call::Kill(STUB, Signal::SIGCONT),
+            Call::WaitAny,
+            Call::WaitAny,
+            Call::EventMessage(STUB),
+            Call::Cont(CHILD, None),
+            Call::Cont(STUB, None),
+            Call::WaitAny,
+            Call::WaitAny,
+        ]
+    );
+}
+
+#[test]
+fn a_clone_event_names_its_task_and_resumes_both_tasks() {
+    let mut tracer = Fake::new(
+        vec![stopped(STUB, Signal::SIGSTOP)],
+        vec![
+            clone_event(STUB),
+            stopped(CHILD, Signal::SIGSTOP),
+            exited(STUB, 0),
+        ],
+    );
+    tracer.events.push_back(Ok(i64::from(CHILD)));
+    let (code, _) = run(&mut tracer, false);
+
+    assert_eq!(code, 0);
+    assert!(tracer.calls.contains(&Call::EventMessage(STUB)));
+    assert!(tracer.calls.contains(&Call::Cont(CHILD, None)));
+    assert!(tracer.calls.contains(&Call::Cont(STUB, None)));
+}
+
+#[test]
+fn a_group_stop_is_resumed_as_a_plain_ptrace_stop() {
+    let mut tracer = Fake::new(
+        vec![stopped(STUB, Signal::SIGSTOP)],
+        vec![
+            Ok(WaitStatus::PtraceEvent(
+                Pid::from_raw(STUB),
+                Signal::SIGSTOP,
+                libc::PTRACE_EVENT_STOP,
+            )),
+            exited(STUB, 0),
+        ],
+    );
+    let (code, _) = run(&mut tracer, false);
+
+    assert_eq!(code, 0);
+    assert!(tracer.calls.contains(&Call::Cont(STUB, None)));
+}
+
+#[test]
+fn a_clone_event_that_names_no_task_still_resumes_the_parent() {
+    let mut tracer = Fake::new(
+        vec![stopped(STUB, Signal::SIGSTOP)],
+        vec![clone_event(STUB), exited(STUB, 0)],
+    );
+    tracer.events.push_back(Err(Errno::ESRCH));
+    let (code, _) = run(&mut tracer, false);
+
+    assert_eq!(code, 0);
+    assert!(tracer.calls.contains(&Call::EventMessage(STUB)));
+    assert!(tracer.calls.contains(&Call::Cont(STUB, None)));
+    assert!(
+        !tracer
+            .calls
+            .iter()
+            .any(|call| matches!(call, Call::Cont(CHILD, _)))
+    );
+}
+
+#[test]
+fn a_fork_event_that_names_no_child_still_resumes_the_parent() {
+    let mut tracer = Fake::new(
+        vec![stopped(STUB, Signal::SIGSTOP)],
+        vec![fork_event(STUB), exited(STUB, 0)],
+    );
+    tracer.events.push_back(Err(Errno::ESRCH));
+    let (code, _) = run(&mut tracer, false);
+
+    assert_eq!(code, 0);
+    assert!(tracer.calls.contains(&Call::EventMessage(STUB)));
+    assert!(tracer.calls.contains(&Call::Cont(STUB, None)));
+    assert!(
+        !tracer
+            .calls
+            .iter()
+            .any(|call| matches!(call, Call::Cont(CHILD, _)))
+    );
 }

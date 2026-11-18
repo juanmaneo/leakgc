@@ -19,6 +19,7 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 
 use crate::maps;
+use crate::monitor::Monitor;
 use crate::trap;
 
 /// Set to any value to log each trapped call and a summary to stderr.
@@ -33,6 +34,11 @@ pub enum Event {
     Exited(Pid, i32),
     Killed(Pid, Signal),
     Trap(Pid),
+    /// The process replaced its image. The parent of a fork or clone is named by `Fork` or `Spawn`.
+    Exec(Pid),
+    Fork(Pid),
+    /// A `vfork` or `clone`. The new task is named by `event_message`.
+    Spawn(Pid),
     PtraceStop(Pid),
     SignalStop(Pid, Signal),
     Ignored,
@@ -43,6 +49,11 @@ pub fn classify(status: WaitStatus) -> Event {
         WaitStatus::Exited(pid, code) => Event::Exited(pid, code),
         WaitStatus::Signaled(pid, signal, _) => Event::Killed(pid, signal),
         WaitStatus::PtraceEvent(pid, _, PTRACE_EVENT_SECCOMP) => Event::Trap(pid),
+        WaitStatus::PtraceEvent(pid, _, libc::PTRACE_EVENT_EXEC) => Event::Exec(pid),
+        WaitStatus::PtraceEvent(pid, _, libc::PTRACE_EVENT_FORK) => Event::Fork(pid),
+        WaitStatus::PtraceEvent(pid, _, libc::PTRACE_EVENT_VFORK | libc::PTRACE_EVENT_CLONE) => {
+            Event::Spawn(pid)
+        }
         WaitStatus::PtraceEvent(pid, _, _) | WaitStatus::PtraceSyscall(pid) => {
             Event::PtraceStop(pid)
         }
@@ -72,6 +83,8 @@ pub trait Tracer {
     /// Runs one instruction. If the stopped thread is at a trapped system call,
     /// the call completes instead of stopping again.
     fn step(&mut self, pid: Pid) -> nix::Result<()>;
+    /// The new task's pid, reported with a fork, vfork or clone event.
+    fn event_message(&mut self, pid: Pid) -> nix::Result<i64>;
     fn read_mem(&mut self, pid: Pid, addr: u64, len: usize) -> io::Result<Vec<u8>>;
     fn write_mem(&mut self, pid: Pid, addr: u64, bytes: &[u8]) -> io::Result<()>;
 }
@@ -141,6 +154,10 @@ impl Tracer for OsTracer {
         ptrace::step(pid, None)
     }
 
+    fn event_message(&mut self, pid: Pid) -> nix::Result<i64> {
+        ptrace::getevent(pid)
+    }
+
     fn read_mem(&mut self, pid: Pid, addr: u64, len: usize) -> io::Result<Vec<u8>> {
         open_mem(pid, false).and_then(|mem| {
             let mut bytes = vec![0; len];
@@ -182,6 +199,12 @@ struct Session<'t, 'l, T: Tracer> {
     tracees: BTreeSet<Pid>,
     traps: BTreeMap<&'static str, u64>,
     root_code: Option<i32>,
+    monitor: Monitor,
+    /// Children whose initial stop came before their fork or clone event. They
+    /// stay stopped until the event names them.
+    early: BTreeSet<Pid>,
+    /// Children named by their event before their initial stop arrived.
+    announced: BTreeSet<Pid>,
 }
 
 impl<T: Tracer> Drop for Session<'_, '_, T> {
@@ -251,15 +274,18 @@ impl<T: Tracer> Session<'_, '_, T> {
                 if pid == self.stub {
                     self.root_code = Some(code);
                 }
+                self.monitor.exited(pid, format!("exit code {code}"));
             }
             Event::Killed(pid, signal) => {
                 if pid == self.stub {
                     self.root_code = Some(128 + signal as i32);
                 }
+                self.monitor.exited(pid, format!("killed by {signal}"));
             }
             Event::Trap(pid) => {
                 self.tracees.insert(pid);
-                let name = match self.tracer.syscall_nr(pid) {
+                let nr = self.tracer.syscall_nr(pid);
+                let name = match nr {
                     Ok(nr) => trap::name_of(nr),
                     Err(_) => "unknown",
                 };
@@ -275,14 +301,44 @@ impl<T: Tracer> Session<'_, '_, T> {
                         pid.as_raw()
                     );
                 }
+                self.monitor.trapped(&mut *self.tracer, pid, nr.ok());
                 let _ = self.tracer.cont(pid, None);
+            }
+            Event::Exec(pid) => {
+                self.tracees.insert(pid);
+                self.monitor.exec(&mut *self.tracer, pid);
+                let _ = self.tracer.cont(pid, None);
+            }
+            Event::Fork(parent) => {
+                self.tracees.insert(parent);
+                if let Some(child) = self.new_task(parent) {
+                    self.monitor.forked(&mut *self.tracer, parent, child);
+                    self.announce(child);
+                }
+                let _ = self.tracer.cont(parent, None);
+            }
+            Event::Spawn(parent) => {
+                self.tracees.insert(parent);
+                if let Some(child) = self.new_task(parent) {
+                    self.announce(child);
+                }
+                let _ = self.tracer.cont(parent, None);
             }
             Event::PtraceStop(pid) => {
                 self.tracees.insert(pid);
                 let _ = self.tracer.cont(pid, None);
             }
             Event::SignalStop(pid, signal) => {
-                self.tracees.insert(pid);
+                let first = self.tracees.insert(pid);
+                if first && signal == Signal::SIGSTOP {
+                    // A new task's initial stop. It runs once its fork or clone event names it.
+                    if self.announced.remove(&pid) {
+                        let _ = self.tracer.cont(pid, None);
+                    } else {
+                        self.early.insert(pid);
+                    }
+                    return;
+                }
                 // SIGSTOP and SIGTRAP are ptrace's own stops, so they are not
                 // delivered to the target.
                 let pass = match signal {
@@ -295,13 +351,38 @@ impl<T: Tracer> Session<'_, '_, T> {
         }
     }
 
+    /// The pid of the task that `parent`'s fork or clone event created. `None`
+    /// when ptrace cannot name it.
+    fn new_task(&mut self, parent: Pid) -> Option<Pid> {
+        match self.tracer.event_message(parent) {
+            Ok(raw) => i32::try_from(raw).ok().map(Pid::from_raw),
+            Err(_) => None,
+        }
+    }
+
+    /// Records that `child` was named by its event. If its initial stop already
+    /// arrived, it runs now.
+    fn announce(&mut self, child: Pid) {
+        if self.early.remove(&child) {
+            let _ = self.tracer.cont(child, None);
+        } else {
+            self.announced.insert(child);
+        }
+    }
+
     fn summarise(&mut self) {
+        let reports = self.monitor.finish();
         let Some(log) = self.log.as_deref_mut() else {
             return;
         };
         let _ = writeln!(log, "leakgc: {} tracees", self.tracees.len());
         for (name, count) in &self.traps {
             let _ = writeln!(log, "leakgc: {name} traps: {count}");
+        }
+        for report in reports {
+            for line in report.lines() {
+                let _ = writeln!(log, "leakgc: {line}");
+            }
         }
     }
 }
@@ -329,6 +410,9 @@ pub fn supervise_with<T: Tracer>(
         tracees: BTreeSet::new(),
         traps: BTreeMap::new(),
         root_code: None,
+        monitor: Monitor::default(),
+        early: BTreeSet::new(),
+        announced: BTreeSet::new(),
     };
     session.run()
 }

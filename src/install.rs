@@ -1,10 +1,16 @@
-//! Installs the E4 entry hook on `malloc` in a stopped, static, non-PIE process
-//! (PLAN 4.6). It runs at the exec-stop, before the target executes anything.
+//! Installs the E4 entry hooks on `malloc`, `free` and `realloc` in a stopped,
+//! static, non-PIE process (PLAN 4.6). It runs at the exec-stop, before the
+//! target executes anything.
 //!
-//! Every check that can refuse runs before the target is touched. The image is
-//! parsed, its live text is read and planned, and only then is an `mmap`
-//! injected. The 5-byte jump is written last, so no thread runs a half-written
-//! trampoline.
+//! Every check that can refuse runs before the target is touched. Each function
+//! is planned and its original bytes are read first. Only then is an `mmap`
+//! injected. The three 5-byte jumps are written last, so no thread runs a
+//! half-written trampoline. If a jump write fails, the jumps already written
+//! are restored.
+//!
+//! The hooks share one depth counter. A hooked function that calls another
+//! hooked function (`realloc` calls `malloc` and `free`) records only the outer
+//! call. Nested calls run their displaced code and nothing more.
 
 use std::io;
 
@@ -18,8 +24,8 @@ use nix::sys::signal::Signal;
 use nix::sys::wait::WaitStatus;
 use nix::unistd::Pid;
 
-use crate::hook::{self, Refusal};
-use crate::ring::{CAPACITY, RECORD_LEN};
+use crate::hook::{self, JMP_LEN, Refusal};
+use crate::ring::{CAPACITY, Kind, RECORD_LEN};
 use crate::supervisor::{PTRACE_EVENT_SECCOMP, Tracer};
 
 /// Where the hook region goes when the caller does not choose. It lies within
@@ -30,8 +36,14 @@ pub const HEAD_OFFSET: u64 = 0x1_0000;
 /// Offset of the first record. Record `i` lives at `i % CAPACITY`.
 pub const RECORDS_OFFSET: u64 = 0x3_0000;
 
+const DEPTH_OFFSET: u64 = HEAD_OFFSET + 8;
 const PENDING_OFFSET: u64 = 0x2_0000;
 const EXIT_OFFSET: u64 = 0x800;
+/// Each hook's entry trampoline, displaced instructions and tail share one block.
+const BLOCK_LEN: u64 = 0x200;
+/// Where the displaced instructions start within a block. The entry trampoline
+/// must assemble to fewer bytes than this.
+const DISPLACED_OFFSET: u64 = 0x180;
 const REGION_LEN: u64 = RECORDS_OFFSET + CAPACITY * RECORD_LEN as u64;
 const INDEX_MASK: i32 = (CAPACITY - 1) as i32;
 const PROT_RWX: u64 = 0x7;
@@ -43,19 +55,54 @@ const SYSCALL: [u8; 2] = [0x0f, 0x05];
 const MAX_SECCOMP_STOPS: usize = 4;
 const ASM: &str = "trampoline instruction assembles";
 const ASM_NEW: &str = "64-bit assembler is available";
+const LAYOUT: &str = "block code fits its slot";
 
-const _: () = assert!(RECORD_LEN == 32);
+const _: () = assert!(RECORD_LEN == 64);
 const _: () = assert!(PENDING_OFFSET + 0x1_0000 == RECORDS_OFFSET);
+const _: () = assert!(DEPTH_OFFSET + 8 <= PENDING_OFFSET);
 
-/// The hook as installed. `base` is the region, and `patch_at` is the address of the jump.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Installed {
-    pub base: u64,
-    pub patch_at: u64,
+/// One hooked function: its symbol, what its record holds, and its block.
+struct Hook {
+    symbol: &'static str,
+    kind: Kind,
+    block: u64,
 }
 
-/// Why the hook was not installed. Every variant leaves the target unpatched,
-/// except that a region may stay mapped (see `install_malloc_at`).
+const HOOKS: [Hook; 3] = [
+    Hook {
+        symbol: "malloc",
+        kind: Kind::Malloc,
+        block: 0,
+    },
+    Hook {
+        symbol: "free",
+        kind: Kind::Free,
+        block: BLOCK_LEN,
+    },
+    Hook {
+        symbol: "realloc",
+        kind: Kind::Realloc,
+        block: 2 * BLOCK_LEN,
+    },
+];
+
+/// A jump written into the target, with the bytes it replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Patch {
+    pub at: u64,
+    pub original: [u8; JMP_LEN],
+}
+
+/// The hooks as installed. `base` is the region, and `patches` lists every
+/// jump written into the target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Installed {
+    pub base: u64,
+    pub patches: Vec<Patch>,
+}
+
+/// Why the hooks were not installed. Every variant leaves the target unpatched,
+/// except that a region may stay mapped (see `install_hooks_at`).
 #[derive(Debug)]
 pub enum InstallError {
     /// Reading the image or the target's memory failed.
@@ -66,9 +113,9 @@ pub enum InstallError {
     Parse(String),
     /// The image is not a static, non-PIE executable (PLAN 4.6).
     NotStaticExecutable,
-    /// No `malloc` function symbol lies in an executable section.
-    NoMalloc,
-    /// The planner refused the entry point, which stays fail-closed (D29).
+    /// No function symbol with this name lies in an executable section.
+    MissingSymbol(&'static str),
+    /// The planner refused an entry point, which stays fail-closed (D29).
     Refused(Refusal),
     /// The region was not mapped at the hint. The value is what `mmap` returned.
     MmapFailed(i64),
@@ -96,15 +143,16 @@ impl From<Refusal> for InstallError {
     }
 }
 
-/// Installs the hook at [`DEFAULT_HINT`].
-pub fn install_malloc<T: Tracer>(tracer: &mut T, pid: Pid) -> Result<Installed, InstallError> {
-    install_malloc_at(tracer, pid, DEFAULT_HINT)
+/// Installs the hooks at [`DEFAULT_HINT`].
+pub fn install_hooks<T: Tracer>(tracer: &mut T, pid: Pid) -> Result<Installed, InstallError> {
+    install_hooks_at(tracer, pid, DEFAULT_HINT)
 }
 
-/// Installs the hook with its region at `hint`, which must lie within rel32
-/// reach of `malloc`. If the injected `mmap` does not return `hint`, nothing
-/// else is written.
-pub fn install_malloc_at<T: Tracer>(
+/// Installs the hooks with their region at `hint`, which must lie within rel32
+/// reach of every hooked function. If the injected `mmap` does not return
+/// `hint`, nothing else is written. A failure after the region is mapped
+/// leaves the region mapped and the target unpatched.
+pub fn install_hooks_at<T: Tracer>(
     tracer: &mut T,
     pid: Pid,
     hint: u64,
@@ -115,15 +163,21 @@ pub fn install_malloc_at<T: Tracer>(
         return Err(InstallError::NotStaticExecutable);
     }
     let text = exec_sections(tracer, pid, &elf)?;
-    let (addr, function) = malloc_function(&elf, &text).ok_or(InstallError::NoMalloc)?;
     let refs: Vec<(u64, &[u8])> = text
         .iter()
         .map(|(start, code)| (*start, code.as_slice()))
         .collect();
 
-    let entry = entry_code(hint);
-    let displaced_at = hint + entry.len() as u64;
-    let plan = hook::plan(addr, function, &refs, hint, displaced_at)?;
+    let mut planned = Vec::with_capacity(HOOKS.len());
+    for hook in &HOOKS {
+        let (addr, function) = function_symbol(&elf, &text, hook.symbol)
+            .ok_or(InstallError::MissingSymbol(hook.symbol))?;
+        let block = hint + hook.block;
+        let plan = hook::plan(addr, function, &refs, block, block + DISPLACED_OFFSET)?;
+        let original = tracer.read_mem(pid, plan.patch_at, JMP_LEN)?;
+        let original: [u8; JMP_LEN] = original.try_into().expect("read JMP_LEN bytes");
+        planned.push((hook, plan, original));
+    }
 
     burn_exec_step(tracer, pid)?;
     let mapped = run_syscall(
@@ -136,20 +190,50 @@ pub fn install_malloc_at<T: Tracer>(
         return Err(InstallError::MmapFailed(mapped));
     }
 
-    let mut code = entry;
-    code.extend_from_slice(&plan.displaced_code);
-    let resume = plan.patch_at + plan.patch_len as u64;
-    code.extend_from_slice(&tail_code(
-        resume,
-        displaced_at + plan.displaced_code.len() as u64,
-    ));
-    tracer.write_mem(pid, hint, &code)?;
+    for (hook, plan, _) in &planned {
+        let block = hint + hook.block;
+        let mut code = pad_to(entry_code(hint, block, hook.kind), DISPLACED_OFFSET);
+        code.extend_from_slice(&plan.displaced_code);
+        let resume = plan.patch_at + plan.patch_len as u64;
+        let tail_at = block + DISPLACED_OFFSET + plan.displaced_code.len() as u64;
+        code.extend_from_slice(&tail_code(resume, tail_at));
+        tracer.write_mem(pid, block, &pad_to(code, BLOCK_LEN))?;
+    }
     tracer.write_mem(pid, hint + EXIT_OFFSET, &exit_code(hint))?;
-    tracer.write_mem(pid, plan.patch_at, &plan.jump)?;
+
+    let mut patches = Vec::with_capacity(planned.len());
+    for (_, plan, original) in planned {
+        if let Err(error) = tracer.write_mem(pid, plan.patch_at, &plan.jump) {
+            restore(tracer, pid, &patches);
+            return Err(error.into());
+        }
+        patches.push(Patch {
+            at: plan.patch_at,
+            original,
+        });
+    }
     Ok(Installed {
         base: hint,
-        patch_at: plan.patch_at,
+        patches,
     })
+}
+
+/// Writes the original bytes back over every jump in `installed`. The region
+/// stays mapped, and its trampolines are left in place. They are unreachable
+/// once the jumps are gone.
+pub fn uninstall<T: Tracer>(tracer: &mut T, pid: Pid, installed: &Installed) -> io::Result<()> {
+    for patch in &installed.patches {
+        tracer.write_mem(pid, patch.at, &patch.original)?;
+    }
+    Ok(())
+}
+
+/// Best effort: a failure here leaves the process patched, and the caller
+/// already has an error to report.
+fn restore<T: Tracer>(tracer: &mut T, pid: Pid, patches: &[Patch]) {
+    for patch in patches {
+        let _ = tracer.write_mem(pid, patch.at, &patch.original);
+    }
 }
 
 /// The executable sections, read from the live process rather than the file,
@@ -169,12 +253,16 @@ fn exec_sections<T: Tracer>(
         .collect()
 }
 
-/// The address and bytes of the `malloc` function symbol.
-fn malloc_function<'a>(elf: &Elf, text: &'a [(u64, Vec<u8>)]) -> Option<(u64, &'a [u8])> {
+/// The address and bytes of the function symbol `name`.
+fn function_symbol<'a>(
+    elf: &Elf,
+    text: &'a [(u64, Vec<u8>)],
+    name: &str,
+) -> Option<(u64, &'a [u8])> {
     let sym = elf
         .syms
         .iter()
-        .find(|sym| sym.is_function() && elf.strtab.get_at(sym.st_name) == Some("malloc"))?;
+        .find(|sym| sym.is_function() && elf.strtab.get_at(sym.st_name) == Some(name))?;
     let (start, code) = text
         .iter()
         .find(|(start, code)| (*start..*start + code.len() as u64).contains(&sym.st_value))?;
@@ -255,77 +343,115 @@ fn arm_and_finish<T: Tracer>(
     Ok(after.rax as i64)
 }
 
-/// The entry trampoline, assembled to run at `base`. It appends a record, parks
-/// the original return address, and returns through the exit stub.
-fn entry_code(base: u64) -> Vec<u8> {
+/// Pads `code` with zeros to exactly `len` bytes. Code that is already longer
+/// would overrun the next part of the layout, so that is a panic, not a silent
+/// overlap.
+fn pad_to(code: Vec<u8>, len: u64) -> Vec<u8> {
+    let len = len as usize;
+    (code.len() <= len)
+        .then(move || {
+            let mut code = code;
+            code.resize(len, 0);
+            code
+        })
+        .expect(LAYOUT)
+}
+
+/// The entry trampoline for `kind`, assembled to run at `block`. When no call
+/// is already being recorded, it stores the call's arguments in a new record,
+/// parks the caller's return address with the record, and returns through the
+/// exit stub. Then it runs the displaced instructions.
+fn entry_code(base: u64, block: u64, kind: Kind) -> Vec<u8> {
     let head = base + HEAD_OFFSET;
+    let depth = base + DEPTH_OFFSET;
     let records = base + RECORDS_OFFSET;
     let pending = base + PENDING_OFFSET;
     let exit = base + EXIT_OFFSET;
+    let displaced = block + DISPLACED_OFFSET;
+    let (size, arg) = captured(kind);
 
     let mut a = CodeAssembler::new(64).expect(ASM_NEW);
+    let mut skip = a.create_label();
     a.pushfq().expect(ASM);
     for reg in [rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11] {
         a.push(reg).expect(ASM);
     }
+    // A nested call is not recorded, and its return address is left alone, so
+    // the outer call's exit stub still runs.
+    a.mov(r11, depth).expect(ASM);
+    a.cmp(qword_ptr(r11), 0i32).expect(ASM);
+    a.jne(skip).expect(ASM);
+    a.mov(qword_ptr(r11), 1i32).expect(ASM);
     // rax = record index: the ring head, bumped and masked.
     a.mov(r11, head).expect(ASM);
     a.mov(eax, 1).expect(ASM);
     a.lock().xadd(qword_ptr(r11), rax).expect(ASM);
     a.and(rax, INDEX_MASK).expect(ASM);
-    // Record: size from rdi, caller return address from the stack.
     a.mov(rcx, rax).expect(ASM);
-    a.shl(rcx, 5).expect(ASM);
+    a.shl(rcx, 6).expect(ASM);
     a.mov(r11, records).expect(ASM);
     a.add(rcx, r11).expect(ASM);
-    a.mov(qword_ptr(rcx), rdi).expect(ASM);
+    if let Some(reg) = size {
+        a.mov(qword_ptr(rcx), reg).expect(ASM);
+    } else {
+        a.mov(qword_ptr(rcx), 0i32).expect(ASM);
+    }
     a.mov(rdx, qword_ptr(rsp + 80)).expect(ASM);
     a.mov(qword_ptr(rcx + 8), rdx).expect(ASM);
-    // Pending slot keyed by the caller's rsp: (original return, record index).
-    a.mov(r10, rsp).expect(ASM);
-    a.add(r10, 88).expect(ASM);
-    a.shr(r10, 3).expect(ASM);
-    a.and(r10, 0xfff).expect(ASM);
-    a.shl(r10, 4).expect(ASM);
-    a.mov(r8, pending).expect(ASM);
-    a.add(r10, r8).expect(ASM);
+    if let Some(reg) = arg {
+        a.mov(qword_ptr(rcx + 16), reg).expect(ASM);
+    } else {
+        a.mov(qword_ptr(rcx + 16), 0i32).expect(ASM);
+    }
+    a.mov(qword_ptr(rcx + 32), kind as i32).expect(ASM);
+    a.mov(qword_ptr(rcx + 40), 0i32).expect(ASM);
+    // Pending: the caller's return address, and the record it belongs to.
+    a.mov(r10, pending).expect(ASM);
     a.mov(qword_ptr(r10), rdx).expect(ASM);
-    a.mov(qword_ptr(r10 + 8), rax).expect(ASM);
-    // Return through the exit stub, which stores the returned pointer.
+    a.mov(qword_ptr(r10 + 8), rcx).expect(ASM);
+    // Return through the exit stub, which stores the result.
     a.mov(rdx, exit).expect(ASM);
     a.mov(qword_ptr(rsp + 80), rdx).expect(ASM);
+    a.set_label(&mut skip).expect(ASM);
     for reg in [r11, r10, r9, r8, rdi, rsi, rdx, rcx, rax] {
         a.pop(reg).expect(ASM);
     }
     a.popfq().expect(ASM);
-    a.assemble(base).expect(ASM)
+    a.jmp(displaced).expect(ASM);
+    a.assemble(block).expect(ASM)
 }
 
-/// The exit stub, placed at `base + EXIT_OFFSET`. It stores `rax` (the returned
-/// pointer) in the record its pending slot names, then returns to the caller.
+/// The argument registers the entry trampoline records for `kind`:
+/// `(size, pointer argument)`.
+fn captured(kind: Kind) -> (Option<AsmRegister64>, Option<AsmRegister64>) {
+    match kind {
+        Kind::Malloc => (Some(rdi), None),
+        Kind::Free => (None, Some(rdi)),
+        Kind::Realloc => (Some(rsi), Some(rdi)),
+    }
+}
+
+/// The exit stub, placed at `base + EXIT_OFFSET`. It stores `rax` (the result)
+/// in the record the pending slot names, clears the depth counter, and returns
+/// to the caller.
 fn exit_code(base: u64) -> Vec<u8> {
-    let records = base + RECORDS_OFFSET;
+    let depth = base + DEPTH_OFFSET;
     let pending = base + PENDING_OFFSET;
 
     let mut a = CodeAssembler::new(64).expect(ASM_NEW);
-    a.mov(rcx, rsp).expect(ASM);
-    a.shr(rcx, 3).expect(ASM);
-    a.and(rcx, 0xfff).expect(ASM);
-    a.shl(rcx, 4).expect(ASM);
-    a.mov(rdx, pending).expect(ASM);
-    a.add(rcx, rdx).expect(ASM);
-    a.mov(rdx, qword_ptr(rcx + 8)).expect(ASM);
-    a.shl(rdx, 5).expect(ASM);
-    a.mov(r11, records).expect(ASM);
-    a.add(rdx, r11).expect(ASM);
-    a.mov(qword_ptr(rdx + 16), rax).expect(ASM);
-    a.mov(r11, qword_ptr(rcx)).expect(ASM);
+    a.mov(r10, pending).expect(ASM);
+    a.mov(r11, qword_ptr(r10)).expect(ASM);
+    a.mov(rcx, qword_ptr(r10 + 8)).expect(ASM);
+    a.mov(qword_ptr(rcx + 24), rax).expect(ASM);
+    a.mov(qword_ptr(rcx + 40), 1i32).expect(ASM);
+    a.mov(r10, depth).expect(ASM);
+    a.mov(qword_ptr(r10), 0i32).expect(ASM);
     a.jmp(r11).expect(ASM);
     a.assemble(base + EXIT_OFFSET).expect(ASM)
 }
 
 /// Runs the displaced instructions, then jumps back to `resume`. `r11` is
-/// caller-saved and is not an argument register of `malloc`.
+/// caller-saved and is not an argument register of any hooked function.
 fn tail_code(resume: u64, ip: u64) -> Vec<u8> {
     let mut a = CodeAssembler::new(64).expect(ASM_NEW);
     a.mov(r11, resume).expect(ASM);
