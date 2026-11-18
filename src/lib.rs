@@ -1,11 +1,20 @@
-//! Core of `leakgc`: a pure, OS-free model of a heap in which unreachable
-//! blocks are found by mark-and-sweep and can be freed at runtime.
+//! Core of `leakgc`.
 //!
-//! This is a port of `ocaml/leakcheck.ml`, which remains the oracle. Nothing
-//! in this crate touches memory, processes or `/proc`; blocks are bookkeeping
-//! records, so every behaviour can be tested without an operating system.
+//! - [`gc`] is a pure, OS-free model of a heap in which unreachable blocks
+//!   are found by mark-and-sweep. It is a port of `ocaml/leakcheck.ml`, which
+//!   remains the oracle. Nothing in `gc` touches memory, processes or `/proc`.
+//! - [`supervisor`], [`stub`], [`trap`] and [`maps`] start the target,
+//!   trap its memory system calls and drain its processes. They sit behind the
+//!   [`supervisor::Tracer`] trait so their control flow can be tested.
+
+#[cfg(not(target_arch = "x86_64"))]
+compile_error!("leakgc's trap filter and register access are x86_64-only");
 
 pub mod gc;
+pub mod maps;
+pub mod stub;
+pub mod supervisor;
+pub mod trap;
 
 #[cfg(test)]
 mod tests {
