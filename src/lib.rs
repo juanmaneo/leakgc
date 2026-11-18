@@ -6,12 +6,16 @@
 //! - [`supervisor`], [`stub`], [`trap`] and [`maps`] start the target,
 //!   trap its memory system calls and drain its processes. They sit behind the
 //!   [`supervisor::Tracer`] trait so their control flow can be tested.
+//! - [`hook`] plans the entry patches for the allocator hooks, and [`ring`]
+//!   describes the record ring they write. Both are pure, as `gc` is.
 
 #[cfg(not(target_arch = "x86_64"))]
 compile_error!("leakgc's trap filter and register access are x86_64-only");
 
 pub mod gc;
+pub mod hook;
 pub mod maps;
+pub mod ring;
 pub mod stub;
 pub mod supervisor;
 pub mod trap;
