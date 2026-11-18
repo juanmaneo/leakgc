@@ -8,7 +8,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs::FileExt;
 
 use nix::errno::Errno;
 use nix::sys::ptrace::{self, Options};
@@ -23,7 +25,7 @@ use crate::trap;
 pub const LOG_ENV: &str = "LEAKGC_LOG";
 
 /// `PTRACE_EVENT_SECCOMP`, the event reported when a trapped call stops.
-const PTRACE_EVENT_SECCOMP: i32 = 7;
+pub(crate) const PTRACE_EVENT_SECCOMP: i32 = 7;
 
 /// What a wait status means to the supervisor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +65,15 @@ pub trait Tracer {
     fn send_signal(&mut self, pid: Pid, sig: Signal) -> nix::Result<()>;
     fn syscall_nr(&mut self, pid: Pid) -> nix::Result<i64>;
     fn read_maps(&mut self, pid: Pid) -> io::Result<String>;
+    /// The executable image as stored on disk, read through `/proc/<pid>/exe`.
+    fn exe_image(&mut self, pid: Pid) -> io::Result<Vec<u8>>;
+    fn regs(&mut self, pid: Pid) -> nix::Result<libc::user_regs_struct>;
+    fn set_regs(&mut self, pid: Pid, regs: libc::user_regs_struct) -> nix::Result<()>;
+    /// Runs one instruction. If the stopped thread is at a trapped system call,
+    /// the call completes instead of stopping again.
+    fn step(&mut self, pid: Pid) -> nix::Result<()>;
+    fn read_mem(&mut self, pid: Pid, addr: u64, len: usize) -> io::Result<Vec<u8>>;
+    fn write_mem(&mut self, pid: Pid, addr: u64, bytes: &[u8]) -> io::Result<()>;
 }
 
 /// The real operating system. Each method forwards one call without
@@ -113,6 +124,41 @@ impl Tracer for OsTracer {
     fn read_maps(&mut self, pid: Pid) -> io::Result<String> {
         std::fs::read_to_string(format!("/proc/{}/maps", pid.as_raw()))
     }
+
+    fn exe_image(&mut self, pid: Pid) -> io::Result<Vec<u8>> {
+        std::fs::read(format!("/proc/{}/exe", pid.as_raw()))
+    }
+
+    fn regs(&mut self, pid: Pid) -> nix::Result<libc::user_regs_struct> {
+        ptrace::getregs(pid)
+    }
+
+    fn set_regs(&mut self, pid: Pid, regs: libc::user_regs_struct) -> nix::Result<()> {
+        ptrace::setregs(pid, regs)
+    }
+
+    fn step(&mut self, pid: Pid) -> nix::Result<()> {
+        ptrace::step(pid, None)
+    }
+
+    fn read_mem(&mut self, pid: Pid, addr: u64, len: usize) -> io::Result<Vec<u8>> {
+        open_mem(pid, false).and_then(|mem| {
+            let mut bytes = vec![0; len];
+            mem.read_exact_at(&mut bytes, addr).map(|()| bytes)
+        })
+    }
+
+    fn write_mem(&mut self, pid: Pid, addr: u64, bytes: &[u8]) -> io::Result<()> {
+        open_mem(pid, true).and_then(|mem| mem.write_all_at(bytes, addr))
+    }
+}
+
+/// The target's memory, through `/proc/<pid>/mem`. The tracee must be stopped.
+fn open_mem(pid: Pid, write: bool) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(write)
+        .open(format!("/proc/{}/mem", pid.as_raw()))
 }
 
 /// Repeats a wait that a signal interrupted.

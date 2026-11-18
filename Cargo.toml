@@ -22,4 +22,5 @@ workspace = true
 libc = "0.2.189"
 nix = { version = "0.31.2", default-features = false, features = ["process", "signal", "ptrace"] }
 seccompiler = "0.5.0"
-iced-x86 = { version = "1.22.0", default-features = false, features = ["std", "decoder", "encoder", "block_encoder"] }
+iced-x86 = { version = "1.22.0", default-features = false, features = ["std", "decoder", "encoder", "block_encoder", "code_asm"] }
+goblin = { version = "0.10.7", default-features = false, features = ["elf32", "elf64", "endian_fd", "std"] }

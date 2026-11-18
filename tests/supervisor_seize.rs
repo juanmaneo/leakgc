@@ -58,6 +58,30 @@ impl Tracer for RefuseSeize {
     fn read_maps(&mut self, pid: Pid) -> io::Result<String> {
         self.os.read_maps(pid)
     }
+
+    fn exe_image(&mut self, pid: Pid) -> io::Result<Vec<u8>> {
+        self.os.exe_image(pid)
+    }
+
+    fn regs(&mut self, pid: Pid) -> nix::Result<libc::user_regs_struct> {
+        self.os.regs(pid)
+    }
+
+    fn set_regs(&mut self, pid: Pid, regs: libc::user_regs_struct) -> nix::Result<()> {
+        self.os.set_regs(pid, regs)
+    }
+
+    fn step(&mut self, pid: Pid) -> nix::Result<()> {
+        self.os.step(pid)
+    }
+
+    fn read_mem(&mut self, pid: Pid, addr: u64, len: usize) -> io::Result<Vec<u8>> {
+        self.os.read_mem(pid, addr, len)
+    }
+
+    fn write_mem(&mut self, pid: Pid, addr: u64, bytes: &[u8]) -> io::Result<()> {
+        self.os.write_mem(pid, addr, bytes)
+    }
 }
 
 #[test]

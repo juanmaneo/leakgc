@@ -114,6 +114,30 @@ impl Tracer for Fake {
             .map(str::to_owned)
             .ok_or_else(|| io::Error::other("no /proc"))
     }
+
+    fn exe_image(&mut self, _pid: Pid) -> io::Result<Vec<u8>> {
+        unreachable!("supervision never reads the image")
+    }
+
+    fn regs(&mut self, _pid: Pid) -> nix::Result<libc::user_regs_struct> {
+        unreachable!("supervision never reads registers")
+    }
+
+    fn set_regs(&mut self, _pid: Pid, _regs: libc::user_regs_struct) -> nix::Result<()> {
+        unreachable!("supervision never writes registers")
+    }
+
+    fn step(&mut self, _pid: Pid) -> nix::Result<()> {
+        unreachable!("supervision never single-steps")
+    }
+
+    fn read_mem(&mut self, _pid: Pid, _addr: u64, _len: usize) -> io::Result<Vec<u8>> {
+        unreachable!("supervision never reads memory")
+    }
+
+    fn write_mem(&mut self, _pid: Pid, _addr: u64, _bytes: &[u8]) -> io::Result<()> {
+        unreachable!("supervision never writes memory")
+    }
 }
 
 fn stopped(pid: i32, sig: Signal) -> Scripted {
