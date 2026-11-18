@@ -1,6 +1,6 @@
 //! Automatic pacing of collections inside `alloc`.
 
-use win_games_leak_garbage_collector::gc::{COLLECT_EVERY, Heap};
+use win_games_leak_garbage_collector::gc::{COLLECT_EVERY, Heap, Mode};
 
 #[test]
 fn collect_every_matches_the_oracle() {
@@ -9,7 +9,7 @@ fn collect_every_matches_the_oracle() {
 
 #[test]
 fn pacing_collects_on_every_collect_every_th_allocation() {
-    let mut heap = Heap::new();
+    let mut heap = Heap::with_mode(Mode::Free);
     for _ in 1..COLLECT_EVERY {
         heap.alloc(&[], "garbage", 1);
     }
@@ -20,6 +20,20 @@ fn pacing_collects_on_every_collect_every_th_allocation() {
     assert_eq!(heap.collections(), 1);
     assert!(heap.block(last).is_some());
     assert_eq!(heap.blocks().count(), 1);
+}
+
+#[test]
+fn report_mode_pacing_reports_without_freeing() {
+    let mut heap = Heap::new();
+    for _ in 0..(2 * COLLECT_EVERY) {
+        heap.alloc(&[], "garbage", 8);
+    }
+
+    assert_eq!(heap.collections(), 2);
+    assert_eq!(heap.blocks().count(), 2 * COLLECT_EVERY as usize);
+    let reports = heap.take_pacing_reports();
+    assert_eq!(reports[1].total_lost_blocks, 2 * COLLECT_EVERY - 1);
+    assert_eq!(reports[1].retained_bytes, (2 * COLLECT_EVERY - 1) * 8);
 }
 
 #[test]
@@ -52,7 +66,7 @@ fn pacing_keeps_rooted_blocks() {
 
 #[test]
 fn refs_to_blocks_freed_by_the_pacing_collection_are_dropped() {
-    let mut heap = Heap::new();
+    let mut heap = Heap::with_mode(Mode::Free);
     let pointee = heap.alloc(&[], "pointee", 8);
     for _ in 2..COLLECT_EVERY {
         heap.alloc(&[], "filler", 1);

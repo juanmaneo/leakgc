@@ -17,6 +17,17 @@ pub use sweep::{LeakReport, SiteLoss};
 
 pub type BlockId = u64;
 
+/// Whether collections free the blocks they find unreachable. Report is the
+/// default (D4): nothing is freed unless the caller opts in with `Free`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Pacing collections report lost blocks and keep them.
+    #[default]
+    Report,
+    /// Pacing collections free lost blocks.
+    Free,
+}
+
 /// One simulated allocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
@@ -41,11 +52,19 @@ pub struct Heap {
     allocs_since_gc: u64,
     collections: u64,
     pacing_reports: Vec<LeakReport>,
+    mode: Mode,
 }
 
 impl Heap {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_mode(mode: Mode) -> Self {
+        Self {
+            mode,
+            ..Self::default()
+        }
     }
 
     pub fn block(&self, id: BlockId) -> Option<&Block> {

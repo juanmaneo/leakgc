@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 
-use win_games_leak_garbage_collector::gc::{Block, BlockId, Heap, LeakReport};
+use win_games_leak_garbage_collector::gc::{Block, BlockId, Heap, LeakReport, Mode};
 
 /// Deterministic PRNG so every run replays the same trace.
 struct XorShift64(u64);
@@ -130,7 +130,7 @@ fn check_collection(heap: &mut Heap) -> (u64, usize) {
 
 #[test]
 fn every_returned_id_survives_pacing_over_200_allocs() {
-    let mut heap = Heap::new();
+    let mut heap = Heap::with_mode(Mode::Free);
     for _ in 0..200 {
         let id = heap.alloc(&[], "garbage", 16);
         assert!(heap.block(id).is_some(), "block {id} was swept by pacing");
@@ -146,7 +146,7 @@ fn randomized_trace_keeps_the_heap_equal_to_the_reachable_set() {
     const CHECK_EVERY: u64 = 250;
 
     let mut rng = XorShift64(0x9E37_79B9_7F4A_7C15);
-    let mut heap = Heap::new();
+    let mut heap = Heap::with_mode(Mode::Free);
     let mut checks = 0;
     let mut lost_blocks = 0;
     let mut max_reachable = 0;

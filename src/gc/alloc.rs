@@ -1,13 +1,14 @@
-use super::{Block, BlockId, Heap, LeakReport};
+use super::{Block, BlockId, Heap, LeakReport, Mode};
 
 /// Allocations between automatic collections. Matches `collect_every` in the oracle.
 pub const COLLECT_EVERY: u64 = 64;
 
 impl Heap {
     /// Registers a block of `size` bytes allocated at `site` and returns its id.
-    /// Every `COLLECT_EVERY` allocations a sweeping collection runs first; its
-    /// report is queued for `take_pacing_reports`. Refs to blocks that are not
-    /// live are dropped and duplicates are removed.
+    /// Every `COLLECT_EVERY` allocations a collection runs first, freeing lost
+    /// blocks only in `Mode::Free`; its report is queued for
+    /// `take_pacing_reports`. Refs to blocks that are not live are dropped and
+    /// duplicates are removed.
     pub fn alloc(&mut self, refs: &[BlockId], site: &str, size: u64) -> BlockId {
         // Pacing runs before registration. The new block is not rooted yet, so a
         // collection after registration would sweep the block this call returns.
@@ -15,7 +16,7 @@ impl Heap {
         self.allocs_since_gc += 1;
         if self.allocs_since_gc >= COLLECT_EVERY {
             self.allocs_since_gc = 0;
-            let report = self.run_collection(true);
+            let report = self.run_collection(self.mode == Mode::Free);
             self.pacing_reports.push(report);
         }
 
