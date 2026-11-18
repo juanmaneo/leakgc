@@ -24,9 +24,11 @@ The shipped binary is built from the following crates. The list comes from `carg
 | seccompiler | 0.5.0 | Apache-2.0 OR BSD-3-Clause | runtime |
 | bitflags | 2.13.2 | MIT OR Apache-2.0 | runtime, via nix |
 | cfg-if | 1.0.5 | MIT OR Apache-2.0 | runtime, via nix |
+| iced-x86 | 1.22.0 | MIT | runtime (decoder, encoder, block_encoder features only) |
+| lazy_static | 1.5.1 | MIT OR Apache-2.0 | runtime, via iced-x86 |
 | cfg_aliases | 0.2.2 | MIT | build-time, via nix |
 
-The `[dependencies]` table in `Cargo.toml` names `libc`, `nix` (with `process`, `signal` and `ptrace` features only) and `seccompiler`. The crates from the earlier planned list that are not used (iced-x86, goblin, scroll, plain, log, lazy_static) are not in the lock file. `proc-macro2`, `quote` and `syn` are in the lock file, but only through `xtask`, so they are not shipped.
+The `[dependencies]` table in `Cargo.toml` names `libc`, `nix` (with `process`, `signal` and `ptrace` features only), `seccompiler` and `iced-x86` (with `decoder`, `encoder` and `block_encoder` features only). The crates from the earlier planned list that are not used (goblin, scroll, plain, log) are not in the lock file. `proc-macro2`, `quote` and `syn` are in the lock file, but only through `xtask`, so they are not shipped.
 
 ## Development tools (not shipped)
 
