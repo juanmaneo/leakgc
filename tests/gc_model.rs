@@ -30,7 +30,6 @@ fn alloc_registers_an_unmarked_block_with_its_fields() {
     assert_eq!(block.site, "build_node:41");
     assert!(block.refs.is_empty());
     assert!(!block.marked);
-    assert!(!block.freed);
     assert_eq!(heap.bytes_allocated(), 64);
 }
 

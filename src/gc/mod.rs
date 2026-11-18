@@ -38,7 +38,6 @@ pub struct Block {
     /// Outgoing edges. Never contains duplicates.
     pub refs: Vec<BlockId>,
     pub marked: bool,
-    pub freed: bool,
 }
 
 /// Heap state, held as a value so that tests and callers can own several

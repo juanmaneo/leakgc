@@ -105,11 +105,7 @@ fn check_collection(heap: &mut Heap) -> (u64, usize) {
     );
     assert_eq!(after, reachable, "the heap is the reachable set afterwards");
     for block in heap.blocks() {
-        assert!(
-            !block.marked && !block.freed,
-            "stale flags on block {}",
-            block.id
-        );
+        assert!(!block.marked, "stale flags on block {}", block.id);
         let unique: BTreeSet<BlockId> = block.refs.iter().copied().collect();
         assert_eq!(
             unique.len(),

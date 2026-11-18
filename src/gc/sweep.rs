@@ -57,10 +57,7 @@ impl Heap {
         if free_leaks {
             for id in &lost {
                 // Ids were gathered from the table above, so they are present.
-                // `freed` is set before the block is dropped, as in the oracle;
-                // removal is what makes a block unreachable.
-                let mut block = self.blocks.remove(id).expect("gathered from the table");
-                block.freed = true;
+                self.blocks.remove(id).expect("gathered from the table");
             }
         }
         for block in self.blocks.values_mut() {

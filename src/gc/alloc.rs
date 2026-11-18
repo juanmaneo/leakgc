@@ -36,7 +36,6 @@ impl Heap {
                 site: site.to_owned(),
                 refs: edges,
                 marked: false,
-                freed: false,
             },
         );
         self.bytes_allocated += size;

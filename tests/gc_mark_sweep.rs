@@ -106,7 +106,7 @@ fn retained_bytes_come_from_the_live_table_not_a_running_total() {
 }
 
 #[test]
-fn marks_and_freed_flags_are_clear_after_every_sweep() {
+fn marks_are_clear_after_every_sweep() {
     let mut heap = Heap::new();
     let root = heap.alloc(&[], "root", 8);
     heap.add_root(root);
@@ -114,7 +114,7 @@ fn marks_and_freed_flags_are_clear_after_every_sweep() {
 
     collect(&mut heap, true);
 
-    assert!(heap.blocks().all(|block| !block.marked && !block.freed));
+    assert!(heap.blocks().all(|block| !block.marked));
 }
 
 #[test]
