@@ -6,11 +6,11 @@ use std::ffi::OsString;
 use std::io;
 use std::process::Command;
 
+use leakgc::supervisor::{OsTracer, Tracer, supervise_with};
 use nix::errno::Errno;
 use nix::sys::signal::Signal;
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::Pid;
-use win_games_leak_garbage_collector::supervisor::{OsTracer, Tracer, supervise_with};
 
 /// The real operating system, except that seizing the stub is refused. The
 /// stub is started from the `leakgc` binary, because `current_exe` here would

@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 
-use win_games_leak_garbage_collector::gc::{Block, BlockId, Heap, LeakReport, Mode};
+use leakgc::gc::{Block, BlockId, Heap, LeakReport, Mode};
 
 /// Deterministic PRNG so every run replays the same trace.
 struct XorShift64(u64);

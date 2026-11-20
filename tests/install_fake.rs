@@ -7,13 +7,13 @@ mod common;
 use goblin::elf::Elf;
 use goblin::elf::section_header::SHF_EXECINSTR;
 use iced_x86::{Decoder, DecoderOptions, Instruction};
-use nix::sys::signal::Signal;
-use nix::sys::wait::WaitStatus;
-use win_games_leak_garbage_collector::hook::{Refusal, jmp_rel32};
-use win_games_leak_garbage_collector::install::{
+use leakgc::hook::{Refusal, jmp_rel32};
+use leakgc::install::{
     DEFAULT_HINT, InstallError, Installed, install_hooks as install_hooks_with_signals,
     install_hooks_at as install_hooks_at_with_signals, uninstall,
 };
+use nix::sys::signal::Signal;
+use nix::sys::wait::WaitStatus;
 
 use common::*;
 

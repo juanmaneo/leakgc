@@ -1,6 +1,6 @@
 //! Roots and edges, exercised through the public API.
 
-use win_games_leak_garbage_collector::gc::Heap;
+use leakgc::gc::Heap;
 
 #[test]
 fn connect_adds_each_edge_once() {

@@ -11,7 +11,7 @@ use nix::sys::wait::WaitStatus;
 use nix::unistd::Pid;
 mod common;
 
-use win_games_leak_garbage_collector::supervisor::{Event, Tracer, classify, supervise_with};
+use leakgc::supervisor::{Event, Tracer, classify, supervise_with};
 
 const STUB: i32 = 100;
 const CHILD: i32 = 101;

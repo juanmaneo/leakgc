@@ -1,6 +1,6 @@
 //! Automatic pacing of collections inside `alloc`.
 
-use win_games_leak_garbage_collector::gc::{COLLECT_EVERY, Heap, Mode};
+use leakgc::gc::{COLLECT_EVERY, Heap, Mode};
 
 #[test]
 fn collect_every_matches_the_oracle() {

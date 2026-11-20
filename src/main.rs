@@ -8,7 +8,7 @@
 
 use std::ffi::OsString;
 
-use win_games_leak_garbage_collector::{stub, supervisor};
+use leakgc::{stub, supervisor};
 
 fn main() {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();

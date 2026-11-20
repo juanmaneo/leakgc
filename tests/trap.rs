@@ -1,4 +1,4 @@
-use win_games_leak_garbage_collector::trap::{TRAPPED, name_of};
+use leakgc::trap::{TRAPPED, name_of};
 
 #[test]
 fn names_every_trapped_call() {

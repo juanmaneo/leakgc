@@ -1,5 +1,5 @@
 use iced_x86::{Decoder, DecoderOptions};
-use win_games_leak_garbage_collector::hook::{JMP_LEN, Plan, Refusal, jmp_rel32, plan};
+use leakgc::hook::{JMP_LEN, Plan, Refusal, jmp_rel32, plan};
 
 const ADDR: u64 = 0x1000;
 const ENTRY: u64 = 0x2000;

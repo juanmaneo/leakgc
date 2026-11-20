@@ -1,4 +1,4 @@
-use win_games_leak_garbage_collector::maps::writable_count;
+use leakgc::maps::writable_count;
 
 #[test]
 fn counts_only_mappings_with_write_permission() {

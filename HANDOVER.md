@@ -38,7 +38,7 @@ leakgc wine game.exe
 Workspace layout:
 
 ```
-Cargo.toml            — package win-games-leak-garbage-collector, edition 2024,
+Cargo.toml            — package leakgc, edition 2024,
                         [[bin]] name = "leakgc", path = "src/main.rs"
 src/main.rs           — leakgc launcher: arg passthrough spawn, exit-code
                         propagation (127 on spawn failure, 2 on usage error)

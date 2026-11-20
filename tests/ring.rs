@@ -1,4 +1,4 @@
-use win_games_leak_garbage_collector::ring::{
+use leakgc::ring::{
     CAPACITY, Drain, Kind, RECORD_LEN, Record, Slot, decode, plan_drain, slot_runs,
 };
 

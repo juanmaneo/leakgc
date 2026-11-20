@@ -7,11 +7,11 @@ mod common;
 use std::collections::BTreeMap;
 
 use common::*;
+use leakgc::install::{DEFAULT_HINT, HEAD_OFFSET, RECORDS_OFFSET};
+use leakgc::ledger::{ImageReport, Site};
+use leakgc::monitor::Monitor;
+use leakgc::ring::{CAPACITY, Kind, RECORD_LEN, Record};
 use nix::unistd::Pid;
-use win_games_leak_garbage_collector::install::{DEFAULT_HINT, HEAD_OFFSET, RECORDS_OFFSET};
-use win_games_leak_garbage_collector::ledger::{ImageReport, Site};
-use win_games_leak_garbage_collector::monitor::Monitor;
-use win_games_leak_garbage_collector::ring::{CAPACITY, Kind, RECORD_LEN, Record};
 
 const CALLER: u64 = 0x40_1000;
 const CLONE_VM: u64 = 0x100;

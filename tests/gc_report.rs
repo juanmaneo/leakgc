@@ -2,7 +2,7 @@
 
 use std::io::{self, Write};
 
-use win_games_leak_garbage_collector::gc::{Heap, LeakReport, SiteLoss, render_report};
+use leakgc::gc::{Heap, LeakReport, SiteLoss, render_report};
 
 /// A writer whose every write fails, to exercise the error path of `collect`.
 struct BrokenWriter;

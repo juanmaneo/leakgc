@@ -5,15 +5,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use goblin::elf::Elf;
+use leakgc::install::{HEAD_OFFSET, RECORDS_OFFSET, install_hooks};
+use leakgc::ring::{CAPACITY, Kind, RECORD_LEN, Slot, decode, plan_drain};
+use leakgc::supervisor::{OsTracer, Tracer};
 use nix::errno::Errno;
 use nix::sys::signal::Signal;
 use nix::sys::wait::WaitStatus;
 use nix::unistd::Pid;
-use win_games_leak_garbage_collector::install::{HEAD_OFFSET, RECORDS_OFFSET, install_hooks};
-use win_games_leak_garbage_collector::ring::{
-    CAPACITY, Kind, RECORD_LEN, Slot, decode, plan_drain,
-};
-use win_games_leak_garbage_collector::supervisor::{OsTracer, Tracer};
 
 fn build_fixture() -> PathBuf {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hooks_static.c");

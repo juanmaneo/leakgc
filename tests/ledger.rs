@@ -1,5 +1,5 @@
-use win_games_leak_garbage_collector::ledger::{ImageReport, Ledger, Site};
-use win_games_leak_garbage_collector::ring::{Kind, Record};
+use leakgc::ledger::{ImageReport, Ledger, Site};
+use leakgc::ring::{Kind, Record};
 
 const A: u64 = 0xa;
 const B: u64 = 0xb;

@@ -1,6 +1,6 @@
 //! Block model and heap state, exercised through the public API.
 
-use win_games_leak_garbage_collector::gc::Heap;
+use leakgc::gc::Heap;
 
 #[test]
 fn new_heap_is_empty() {

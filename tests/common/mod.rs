@@ -12,13 +12,13 @@ use std::sync::OnceLock;
 
 use goblin::elf::Elf;
 use goblin::elf::section_header::{SHF_ALLOC, SHT_PROGBITS};
+use leakgc::install::DEFAULT_HINT;
+use leakgc::supervisor::Tracer;
 use libc::user_regs_struct;
 use nix::errno::Errno;
 use nix::sys::signal::Signal;
 use nix::sys::wait::WaitStatus;
 use nix::unistd::Pid;
-use win_games_leak_garbage_collector::install::DEFAULT_HINT;
-use win_games_leak_garbage_collector::supervisor::Tracer;
 
 pub const TRACEE: i32 = 100;
 pub const PTRACE_EVENT_SECCOMP: i32 = 7;

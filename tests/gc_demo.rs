@@ -1,7 +1,7 @@
 //! Golden transcript: the demo must reproduce the output of
 //! `ocaml ocaml/leakcheck.ml` byte for byte.
 
-use win_games_leak_garbage_collector::gc::demo_transcript;
+use leakgc::gc::demo_transcript;
 
 const ORACLE_OUTPUT: &str = r#"--- scenario 1: well-behaved code ---
 

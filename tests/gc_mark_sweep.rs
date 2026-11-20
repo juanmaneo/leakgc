@@ -2,7 +2,7 @@
 
 use std::io;
 
-use win_games_leak_garbage_collector::gc::{Heap, LeakReport, SiteLoss};
+use leakgc::gc::{Heap, LeakReport, SiteLoss};
 
 fn site(name: &str, blocks: u64, bytes: u64) -> SiteLoss {
     SiteLoss {

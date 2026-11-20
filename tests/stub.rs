@@ -5,7 +5,7 @@
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 
-use win_games_leak_garbage_collector::stub::run_stub;
+use leakgc::stub::run_stub;
 
 #[test]
 fn no_arguments_is_a_usage_error() {

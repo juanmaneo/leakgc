@@ -6,7 +6,7 @@ use std::process::Command;
 
 use goblin::elf::Elf;
 use goblin::elf::section_header::SHT_NOBITS;
-use win_games_leak_garbage_collector::hook::{Plan, Refusal, plan};
+use leakgc::hook::{Plan, Refusal, plan};
 
 const ENTRY: u64 = 0x1000_0000;
 const DISPLACED: u64 = ENTRY + 0x180;
