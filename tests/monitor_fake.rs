@@ -48,7 +48,7 @@ fn hooked() -> Hooked {
     let mut fake = Fake::new(static_image(), vec![trap(), seccomp(), trap()]);
     let pristine = fake.mem.clone();
     let mut monitor = Monitor::default();
-    monitor.exec(&mut fake, pid());
+    assert!(monitor.exec(&mut fake, pid()).is_empty());
     assert_eq!(fake.writes.len(), 9, "the install wrote every hook");
     let jumps = fake.writes[6..]
         .iter()
@@ -368,7 +368,7 @@ fn a_new_image_archives_the_old_one_and_a_dynamic_image_is_not_covered() {
     let mut h = hooked();
     let mut dynamic = Fake::new(dynamic_image(), vec![]);
 
-    h.monitor.exec(&mut dynamic, pid());
+    assert!(h.monitor.exec(&mut dynamic, pid()).is_empty());
 
     let reports = h.monitor.finish();
     assert_eq!(reports.len(), 2, "{reports:?}");

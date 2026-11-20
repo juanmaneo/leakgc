@@ -11,10 +11,23 @@ use nix::sys::signal::Signal;
 use nix::sys::wait::WaitStatus;
 use win_games_leak_garbage_collector::hook::{Refusal, jmp_rel32};
 use win_games_leak_garbage_collector::install::{
-    DEFAULT_HINT, InstallError, Installed, install_hooks, install_hooks_at, uninstall,
+    DEFAULT_HINT, InstallError, Installed, install_hooks as install_hooks_with_signals,
+    install_hooks_at as install_hooks_at_with_signals, uninstall,
 };
 
 use common::*;
+
+fn install_hooks(fake: &mut Fake, pid: nix::unistd::Pid) -> Result<Installed, InstallError> {
+    install_hooks_with_signals(fake, pid, &mut Vec::new())
+}
+
+fn install_hooks_at(
+    fake: &mut Fake,
+    pid: nix::unistd::Pid,
+    hint: u64,
+) -> Result<Installed, InstallError> {
+    install_hooks_at_with_signals(fake, pid, hint, &mut Vec::new())
+}
 
 /// A 64-byte ELF header with no sections or segments.
 fn header_only(e_type: u16) -> Vec<u8> {
@@ -209,29 +222,51 @@ fn an_mmap_at_another_address_is_refused() {
 }
 
 #[test]
-fn a_stop_other_than_the_exec_trap_is_refused_before_injection() {
+fn a_signal_during_the_exec_step_is_deferred_until_install_finishes() {
     let image = static_image();
-    let mut fake = Fake::new(image, vec![stopped(Signal::SIGSTOP)]);
-
-    let result = install_hooks(&mut fake, pid());
-
-    assert!(
-        matches!(
-            result,
-            Err(InstallError::UnexpectedStop(WaitStatus::Stopped(
-                _,
-                Signal::SIGSTOP
-            )))
-        ),
-        "got {result:?}"
+    let mut fake = Fake::new(
+        image,
+        vec![stopped(Signal::SIGWINCH), trap(), trap(), trap()],
     );
-    assert!(fake.writes.is_empty());
+    let mut signals = Vec::new();
+
+    let result = install_hooks_with_signals(&mut fake, pid(), &mut signals);
+
+    assert!(result.is_ok(), "got {result:?}");
+    assert_eq!(signals, [Signal::SIGWINCH]);
 }
 
 #[test]
-fn a_stop_other_than_the_syscall_trap_is_refused() {
+fn an_unexpected_stop_during_the_exec_step_is_refused() {
     let image = static_image();
-    let mut fake = Fake::new(image, vec![trap(), stopped(Signal::SIGSTOP)]);
+    let mut fake = Fake::new(
+        image,
+        vec![Ok(WaitStatus::PtraceEvent(
+            pid(),
+            Signal::SIGTRAP,
+            libc::PTRACE_EVENT_EXEC,
+        ))],
+    );
+
+    let result = install_hooks(&mut fake, pid());
+
+    assert!(matches!(result, Err(InstallError::UnexpectedStop(_))));
+}
+
+#[test]
+fn a_non_signal_stop_other_than_the_syscall_trap_is_refused() {
+    let image = static_image();
+    let mut fake = Fake::new(
+        image,
+        vec![
+            trap(),
+            Ok(WaitStatus::PtraceEvent(
+                pid(),
+                Signal::SIGTRAP,
+                libc::PTRACE_EVENT_EXEC,
+            )),
+        ],
+    );
 
     let result = install_hooks(&mut fake, pid());
 
@@ -240,6 +275,126 @@ fn a_stop_other_than_the_syscall_trap_is_refused() {
         "got {result:?}"
     );
     assert_eq!(fake.writes.len(), 2, "the syscall bytes are still restored");
+}
+
+#[test]
+fn a_target_sigtrap_is_distinguished_from_the_single_step_trap() {
+    let image = static_image();
+    let mut fake = Fake::new(
+        image,
+        vec![stopped(Signal::SIGTRAP), trap(), seccomp(), trap()],
+    );
+    fake.single_step_results
+        .extend([Ok(false), Ok(true), Ok(true)]);
+    let mut signals = Vec::new();
+
+    let result = install_hooks_with_signals(&mut fake, pid(), &mut signals);
+
+    assert!(result.is_ok(), "got {result:?}");
+    assert_eq!(signals, [Signal::SIGTRAP]);
+}
+
+#[test]
+fn a_target_sigtrap_during_the_injected_syscall_is_carried() {
+    let image = static_image();
+    let mut fake = Fake::new(image, vec![trap(), trap(), trap()]);
+    fake.single_step_results
+        .extend([Ok(true), Ok(false), Ok(true)]);
+    let mut signals = Vec::new();
+
+    let result = install_hooks_with_signals(&mut fake, pid(), &mut signals);
+
+    assert!(result.is_ok(), "got {result:?}");
+    assert_eq!(signals, [Signal::SIGTRAP]);
+}
+
+#[test]
+fn a_siginfo_error_aborts_the_install_and_restores_the_target() {
+    let image = static_image();
+    let mut fake = Fake::new(image, vec![stopped(Signal::SIGTRAP)]);
+    fake.single_step_results
+        .push_back(Err(nix::errno::Errno::EIO));
+    let mut signals = Vec::new();
+
+    let result = install_hooks_with_signals(&mut fake, pid(), &mut signals);
+
+    assert!(matches!(
+        result,
+        Err(InstallError::Os(nix::errno::Errno::EIO))
+    ));
+    assert_eq!(signals, [Signal::SIGTRAP]);
+}
+
+#[test]
+fn a_siginfo_error_during_the_injected_syscall_keeps_sigtrap_pending() {
+    let image = static_image();
+    let mut fake = Fake::new(image, vec![trap(), trap()]);
+    fake.single_step_results
+        .extend([Ok(true), Err(nix::errno::Errno::EIO)]);
+    let mut signals = Vec::new();
+
+    let result = install_hooks_with_signals(&mut fake, pid(), &mut signals);
+
+    assert!(matches!(
+        result,
+        Err(InstallError::Os(nix::errno::Errno::EIO))
+    ));
+    assert_eq!(signals, [Signal::SIGTRAP]);
+    assert_eq!(fake.writes.len(), 2, "the injected bytes are restored");
+}
+
+#[test]
+fn a_step_error_after_a_target_sigtrap_keeps_the_signal_and_restores_state() {
+    let image = static_image();
+    let mut fake = Fake::new(image, vec![trap(), stopped(Signal::SIGTRAP)]);
+    fake.single_step_results.extend([Ok(true), Ok(false)]);
+    fake.step_results
+        .extend([Ok(()), Ok(()), Err(nix::errno::Errno::EIO)]);
+    let mut signals = Vec::new();
+
+    let result = install_hooks_with_signals(&mut fake, pid(), &mut signals);
+
+    assert!(matches!(
+        result,
+        Err(InstallError::Os(nix::errno::Errno::EIO))
+    ));
+    assert_eq!(signals, [Signal::SIGTRAP]);
+    assert_eq!(fake.writes.len(), 2, "the injected bytes are restored");
+}
+
+#[test]
+fn a_step_error_after_a_non_trap_signal_preserves_it_and_restores_state() {
+    let image = static_image();
+    let mut fake = Fake::new(image, vec![trap(), stopped(Signal::SIGTERM)]);
+    fake.step_results
+        .extend([Ok(()), Ok(()), Err(nix::errno::Errno::EIO)]);
+    let mut signals = Vec::new();
+
+    let result = install_hooks_with_signals(&mut fake, pid(), &mut signals);
+
+    assert!(matches!(
+        result,
+        Err(InstallError::Os(nix::errno::Errno::EIO))
+    ));
+    assert_eq!(signals, [Signal::SIGTERM]);
+    assert_eq!(fake.writes.len(), 2, "the injected bytes are restored");
+}
+
+#[test]
+fn a_signal_during_the_injected_syscall_is_carried_even_if_install_later_fails() {
+    let image = static_image();
+    let mut fake = Fake::new(
+        image,
+        vec![trap(), seccomp(), stopped(Signal::SIGTERM), trap()],
+    );
+    fake.mmap_result = -17;
+    let mut signals = Vec::new();
+
+    let result = install_hooks_with_signals(&mut fake, pid(), &mut signals);
+
+    assert!(matches!(result, Err(InstallError::MmapFailed(-17))));
+    assert_eq!(signals, [Signal::SIGTERM]);
+    assert_eq!(fake.writes.len(), 2, "the injected bytes are restored");
 }
 
 #[test]

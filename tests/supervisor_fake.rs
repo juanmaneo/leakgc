@@ -9,6 +9,8 @@ use nix::errno::Errno;
 use nix::sys::signal::Signal;
 use nix::sys::wait::WaitStatus;
 use nix::unistd::Pid;
+mod common;
+
 use win_games_leak_garbage_collector::supervisor::{Event, Tracer, classify, supervise_with};
 
 const STUB: i32 = 100;
@@ -44,6 +46,9 @@ struct Fake {
     seize_result: nix::Result<()>,
     cont_result: nix::Result<()>,
     fail_signal: Option<Signal>,
+    signal_error: Errno,
+    install: Option<common::Fake>,
+    started: bool,
     syscall_result: nix::Result<i64>,
     maps: Option<&'static str>,
     events: VecDeque<nix::Result<i64>>,
@@ -59,6 +64,9 @@ impl Fake {
             seize_result: Ok(()),
             cont_result: Ok(()),
             fail_signal: None,
+            signal_error: Errno::ESRCH,
+            install: None,
+            started: false,
             syscall_result: Ok(libc::SYS_execve),
             maps: Some(MAPS),
             events: VecDeque::new(),
@@ -79,7 +87,17 @@ impl Tracer for Fake {
 
     fn wait_stopped(&mut self, pid: Pid) -> nix::Result<WaitStatus> {
         self.calls.push(Call::WaitStopped(pid.as_raw()));
-        self.stopped.pop_front().unwrap_or(Err(Errno::ECHILD))
+        if !self.started {
+            let status = self.stopped.pop_front().unwrap_or(Err(Errno::ECHILD));
+            if matches!(status, Ok(WaitStatus::Stopped(_, Signal::SIGSTOP))) {
+                self.started = true;
+            }
+            return status;
+        }
+        self.install
+            .as_mut()
+            .expect("install tracer configured")
+            .wait_stopped(pid)
     }
 
     fn wait_any(&mut self) -> nix::Result<WaitStatus> {
@@ -100,7 +118,7 @@ impl Tracer for Fake {
     fn send_signal(&mut self, pid: Pid, sig: Signal) -> nix::Result<()> {
         self.calls.push(Call::Kill(pid.as_raw(), sig));
         if self.fail_signal == Some(sig) {
-            Err(Errno::ESRCH)
+            Err(self.signal_error)
         } else {
             Ok(())
         }
@@ -118,20 +136,39 @@ impl Tracer for Fake {
             .ok_or_else(|| io::Error::other("no /proc"))
     }
 
-    fn exe_image(&mut self, _pid: Pid) -> io::Result<Vec<u8>> {
-        Err(io::Error::other("no image in the scripted tracer"))
+    fn exe_image(&mut self, pid: Pid) -> io::Result<Vec<u8>> {
+        match self.install.as_mut() {
+            Some(install) => install.exe_image(pid),
+            None => Err(io::Error::other("no image in the scripted tracer")),
+        }
     }
 
-    fn regs(&mut self, _pid: Pid) -> nix::Result<libc::user_regs_struct> {
-        unreachable!("supervision never reads registers")
+    fn regs(&mut self, pid: Pid) -> nix::Result<libc::user_regs_struct> {
+        self.install
+            .as_mut()
+            .expect("install tracer configured")
+            .regs(pid)
     }
 
-    fn set_regs(&mut self, _pid: Pid, _regs: libc::user_regs_struct) -> nix::Result<()> {
-        unreachable!("supervision never writes registers")
+    fn set_regs(&mut self, pid: Pid, regs: libc::user_regs_struct) -> nix::Result<()> {
+        self.install
+            .as_mut()
+            .expect("install tracer configured")
+            .set_regs(pid, regs)
     }
 
-    fn step(&mut self, _pid: Pid) -> nix::Result<()> {
-        unreachable!("supervision never single-steps")
+    fn step(&mut self, pid: Pid) -> nix::Result<()> {
+        self.install
+            .as_mut()
+            .expect("install tracer configured")
+            .step(pid)
+    }
+
+    fn is_single_step_trap(&mut self, pid: Pid) -> nix::Result<bool> {
+        self.install
+            .as_mut()
+            .expect("install tracer configured")
+            .is_single_step_trap(pid)
     }
 
     fn event_message(&mut self, pid: Pid) -> nix::Result<i64> {
@@ -139,12 +176,18 @@ impl Tracer for Fake {
         self.events.pop_front().unwrap_or(Err(Errno::ESRCH))
     }
 
-    fn read_mem(&mut self, _pid: Pid, _addr: u64, _len: usize) -> io::Result<Vec<u8>> {
-        unreachable!("supervision never reads memory")
+    fn read_mem(&mut self, pid: Pid, addr: u64, len: usize) -> io::Result<Vec<u8>> {
+        self.install
+            .as_mut()
+            .expect("install tracer configured")
+            .read_mem(pid, addr, len)
     }
 
-    fn write_mem(&mut self, _pid: Pid, _addr: u64, _bytes: &[u8]) -> io::Result<()> {
-        unreachable!("supervision never writes memory")
+    fn write_mem(&mut self, pid: Pid, addr: u64, bytes: &[u8]) -> io::Result<()> {
+        self.install
+            .as_mut()
+            .expect("install tracer configured")
+            .write_mem(pid, addr, bytes)
     }
 }
 
@@ -227,6 +270,142 @@ fn happy_path_resumes_every_stop_and_returns_the_root_exit_code() {
             Call::WaitAny,
         ]
     );
+}
+
+#[test]
+fn a_signal_seen_during_install_is_requeued_before_the_exec_resumes() {
+    let mut tracer = Fake::new(
+        vec![stopped(STUB, Signal::SIGSTOP)],
+        vec![
+            exec_event(STUB),
+            stopped(STUB, Signal::SIGCHLD),
+            stopped(STUB, Signal::SIGSTOP),
+            stopped(STUB, Signal::SIGWINCH),
+            exited(STUB, 0),
+        ],
+    );
+    tracer.install = Some(common::Fake::new(
+        common::static_image(),
+        vec![
+            common::stopped(Signal::SIGWINCH),
+            common::stopped(Signal::SIGSTOP),
+            common::trap(),
+            common::seccomp(),
+            common::trap(),
+        ],
+    ));
+
+    let (code, _) = run(&mut tracer, false);
+
+    assert_eq!(code, 0);
+    let requeue = tracer
+        .calls
+        .iter()
+        .position(|call| *call == Call::Kill(STUB, Signal::SIGWINCH))
+        .expect("install signal re-queued");
+    let resume = tracer
+        .calls
+        .iter()
+        .position(|call| *call == Call::Cont(STUB, None))
+        .expect("exec stop resumed");
+    assert!(
+        requeue < resume,
+        "signal is queued before resuming the exec stop"
+    );
+    assert!(
+        tracer
+            .calls
+            .contains(&Call::Cont(STUB, Some(Signal::SIGCHLD)))
+    );
+    assert!(
+        tracer
+            .calls
+            .contains(&Call::Cont(STUB, Some(Signal::SIGWINCH)))
+    );
+    assert!(
+        tracer
+            .calls
+            .contains(&Call::Cont(STUB, Some(Signal::SIGSTOP)))
+    );
+}
+
+#[test]
+fn a_target_sigtrap_is_not_suppressed_as_a_ptrace_step_trap() {
+    let mut tracer = Fake::new(
+        vec![stopped(STUB, Signal::SIGSTOP)],
+        vec![
+            exec_event(STUB),
+            stopped(STUB, Signal::SIGTRAP),
+            exited(STUB, 0),
+        ],
+    );
+    let mut install = common::Fake::new(
+        common::static_image(),
+        vec![
+            common::stopped(Signal::SIGTRAP),
+            common::trap(),
+            common::seccomp(),
+            common::trap(),
+        ],
+    );
+    install
+        .single_step_results
+        .extend([Ok(false), Ok(true), Ok(true)]);
+    tracer.install = Some(install);
+
+    let (code, _) = run(&mut tracer, false);
+
+    assert_eq!(code, 0);
+    assert!(
+        tracer
+            .calls
+            .contains(&Call::Cont(STUB, Some(Signal::SIGTRAP)))
+    );
+}
+
+#[test]
+fn a_refused_signal_requeue_is_reported_and_fails_the_run() {
+    let mut tracer = Fake::new(
+        vec![stopped(STUB, Signal::SIGSTOP)],
+        vec![exec_event(STUB), exited(STUB, 0)],
+    );
+    tracer.install = Some(common::Fake::new(
+        common::static_image(),
+        vec![
+            common::stopped(Signal::SIGWINCH),
+            common::trap(),
+            common::seccomp(),
+            common::trap(),
+        ],
+    ));
+    tracer.fail_signal = Some(Signal::SIGWINCH);
+    tracer.signal_error = Errno::EPERM;
+
+    let (code, _) = run(&mut tracer, false);
+
+    assert_eq!(code, 1);
+}
+
+#[test]
+fn a_signal_requeue_for_an_exited_tracee_does_not_replace_its_exit_status() {
+    let mut tracer = Fake::new(
+        vec![stopped(STUB, Signal::SIGSTOP)],
+        vec![exec_event(STUB), killed(STUB, Signal::SIGTERM)],
+    );
+    tracer.install = Some(common::Fake::new(
+        common::static_image(),
+        vec![
+            common::stopped(Signal::SIGWINCH),
+            common::trap(),
+            common::seccomp(),
+            common::trap(),
+        ],
+    ));
+    tracer.fail_signal = Some(Signal::SIGWINCH);
+
+    let (code, _) = run(&mut tracer, false);
+
+    assert_eq!(code, 143, "ESRCH means the tracee is already gone");
 }
 
 #[test]

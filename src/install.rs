@@ -143,19 +143,28 @@ impl From<Refusal> for InstallError {
     }
 }
 
-/// Installs the hooks at [`DEFAULT_HINT`].
-pub fn install_hooks<T: Tracer>(tracer: &mut T, pid: Pid) -> Result<Installed, InstallError> {
-    install_hooks_at(tracer, pid, DEFAULT_HINT)
+/// Installs the hooks at [`DEFAULT_HINT`]. Signal-delivery stops are appended
+/// to `pending_signals`, including when installation later returns an error;
+/// the caller must re-queue them after the tracee is safe to resume.
+pub fn install_hooks<T: Tracer>(
+    tracer: &mut T,
+    pid: Pid,
+    pending_signals: &mut Vec<Signal>,
+) -> Result<Installed, InstallError> {
+    install_hooks_at(tracer, pid, DEFAULT_HINT, pending_signals)
 }
 
 /// Installs the hooks with their region at `hint`, which must lie within rel32
 /// reach of every hooked function. If the injected `mmap` does not return
 /// `hint`, nothing else is written. A failure after the region is mapped
-/// leaves the region mapped and the target unpatched.
+/// leaves the region mapped and the target unpatched. Signal-delivery stops
+/// are appended to `pending_signals`, including when installation later fails;
+/// the caller must re-queue them after the tracee is safe to resume.
 pub fn install_hooks_at<T: Tracer>(
     tracer: &mut T,
     pid: Pid,
     hint: u64,
+    pending_signals: &mut Vec<Signal>,
 ) -> Result<Installed, InstallError> {
     let image = tracer.exe_image(pid)?;
     let elf = Elf::parse(&image).map_err(|error| InstallError::Parse(error.to_string()))?;
@@ -179,12 +188,13 @@ pub fn install_hooks_at<T: Tracer>(
         planned.push((hook, plan, original));
     }
 
-    burn_exec_step(tracer, pid)?;
+    burn_exec_step(tracer, pid, pending_signals)?;
     let mapped = run_syscall(
         tracer,
         pid,
         libc::SYS_mmap as u64,
         [hint, REGION_LEN, PROT_RWX, MAP_FLAGS, u64::MAX, 0],
+        pending_signals,
     )?;
     if mapped as u64 != hint {
         return Err(InstallError::MmapFailed(mapped));
@@ -273,12 +283,45 @@ fn function_symbol<'a>(
 
 /// Runs one instruction so the exec-stop's pending kernel state is consumed.
 /// Without this, an injected `syscall` silently does not run (PLAN 7b).
-fn burn_exec_step<T: Tracer>(tracer: &mut T, pid: Pid) -> Result<(), InstallError> {
-    tracer.step(pid)?;
-    match tracer.wait_stopped(pid)? {
-        WaitStatus::Stopped(_, Signal::SIGTRAP) => Ok(()),
-        other => Err(InstallError::UnexpectedStop(other)),
+fn burn_exec_step<T: Tracer>(
+    tracer: &mut T,
+    pid: Pid,
+    pending_signals: &mut Vec<Signal>,
+) -> Result<(), InstallError> {
+    loop {
+        tracer.step(pid)?;
+        match tracer.wait_stopped(pid)? {
+            WaitStatus::Stopped(_, Signal::SIGTRAP) => {
+                if step_completed(tracer, pid, pending_signals)? {
+                    return Ok(());
+                }
+            }
+            WaitStatus::Stopped(_, signal) => pending_signals.push(signal),
+            other => return Err(InstallError::UnexpectedStop(other)),
+        }
     }
+}
+
+/// Whether a SIGTRAP stop is the end of the single-step we asked for. If it is
+/// a SIGTRAP sent to the target, it is added to `pending_signals`, and the
+/// caller steps again.
+fn step_completed<T: Tracer>(
+    tracer: &mut T,
+    pid: Pid,
+    pending_signals: &mut Vec<Signal>,
+) -> Result<bool, InstallError> {
+    let is_step = match tracer.is_single_step_trap(pid) {
+        Ok(is_step) => is_step,
+        Err(error) => {
+            pending_signals.push(Signal::SIGTRAP);
+            return Err(error.into());
+        }
+    };
+    if is_step {
+        return Ok(true);
+    }
+    pending_signals.push(Signal::SIGTRAP);
+    Ok(false)
 }
 
 /// Runs one system call at the target's instruction pointer and returns its
@@ -289,11 +332,12 @@ fn run_syscall<T: Tracer>(
     pid: Pid,
     nr: u64,
     args: [u64; 6],
+    pending_signals: &mut Vec<Signal>,
 ) -> Result<i64, InstallError> {
     let saved = tracer.regs(pid)?;
     let original = tracer.read_mem(pid, saved.rip, SYSCALL.len())?;
     tracer.write_mem(pid, saved.rip, &SYSCALL)?;
-    let outcome = arm_and_finish(tracer, pid, saved, nr, args);
+    let outcome = arm_and_finish(tracer, pid, saved, nr, args, pending_signals);
     let restored_bytes = tracer.write_mem(pid, saved.rip, &original);
     let restored_regs = tracer.set_regs(pid, saved);
     let result = outcome?;
@@ -308,6 +352,7 @@ fn arm_and_finish<T: Tracer>(
     saved: user_regs_struct,
     nr: u64,
     args: [u64; 6],
+    pending_signals: &mut Vec<Signal>,
 ) -> Result<i64, InstallError> {
     let armed = user_regs_struct {
         rax: nr,
@@ -332,7 +377,16 @@ fn arm_and_finish<T: Tracer>(
                 seccomp_stops += 1;
                 tracer.step(pid)?;
             }
-            WaitStatus::Stopped(_, Signal::SIGTRAP) => break,
+            WaitStatus::Stopped(_, Signal::SIGTRAP) => {
+                if step_completed(tracer, pid, pending_signals)? {
+                    break;
+                }
+                tracer.step(pid)?;
+            }
+            WaitStatus::Stopped(_, signal) => {
+                pending_signals.push(signal);
+                tracer.step(pid)?;
+            }
             other => return Err(InstallError::UnexpectedStop(other)),
         }
     }

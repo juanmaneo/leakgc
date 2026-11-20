@@ -88,6 +88,8 @@ pub struct Fake {
     pub events: VecDeque<nix::Result<i64>>,
     pub mmap_result: i64,
     pub syscall_advances: bool,
+    pub step_results: VecDeque<nix::Result<()>>,
+    pub single_step_results: VecDeque<nix::Result<bool>>,
     pub fail_at: Option<usize>,
     pub calls: usize,
     pub writes: Vec<(u64, Vec<u8>)>,
@@ -119,6 +121,8 @@ impl Fake {
             events: VecDeque::new(),
             mmap_result: DEFAULT_HINT as i64,
             syscall_advances: true,
+            step_results: VecDeque::new(),
+            single_step_results: VecDeque::new(),
             fail_at: None,
             calls: 0,
             writes: Vec::new(),
@@ -206,7 +210,10 @@ impl Tracer for Fake {
     }
 
     fn step(&mut self, _pid: Pid) -> nix::Result<()> {
-        if self.fails() {
+        let failed = self.fails();
+        if let Some(result) = self.step_results.pop_front() {
+            result?;
+        } else if failed {
             return Err(Errno::EIO);
         }
         let rip = self.regs.rip;
@@ -219,6 +226,10 @@ impl Tracer for Fake {
             self.regs.rip += SYSCALL.len() as u64;
         }
         Ok(())
+    }
+
+    fn is_single_step_trap(&mut self, _pid: Pid) -> nix::Result<bool> {
+        self.single_step_results.pop_front().unwrap_or(Ok(true))
     }
 
     fn event_message(&mut self, _pid: Pid) -> nix::Result<i64> {

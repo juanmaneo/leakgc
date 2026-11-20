@@ -82,7 +82,7 @@ fn the_hooks_record_each_call_from_main_and_not_the_calls_inside_them() {
             Err(Errno::ECHILD) => break,
             Err(error) => panic!("wait failed: {error}"),
             Ok(WaitStatus::PtraceEvent(pid, _, libc::PTRACE_EVENT_EXEC)) => {
-                let installed = install_hooks(&mut os, pid)
+                let installed = install_hooks(&mut os, pid, &mut Vec::new())
                     .unwrap_or_else(|error| panic!("install failed: {error:?}"));
                 base = Some(installed.base);
                 os.cont(pid, None).expect("resume after install");

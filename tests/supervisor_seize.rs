@@ -75,6 +75,10 @@ impl Tracer for RefuseSeize {
         self.os.step(pid)
     }
 
+    fn is_single_step_trap(&mut self, pid: Pid) -> nix::Result<bool> {
+        self.os.is_single_step_trap(pid)
+    }
+
     fn event_message(&mut self, pid: Pid) -> nix::Result<i64> {
         self.os.event_message(pid)
     }

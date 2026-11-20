@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::io;
 
+use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 
 use crate::install::{HEAD_OFFSET, Installed, RECORDS_OFFSET, install_hooks, uninstall};
@@ -132,14 +133,15 @@ pub struct Monitor {
 impl Monitor {
     /// A new image: the process just reached its exec-stop. Any state the pid
     /// had is archived first, because the exec replaces the image.
-    pub fn exec<T: Tracer>(&mut self, tracer: &mut T, pid: Pid) {
+    pub fn exec<T: Tracer>(&mut self, tracer: &mut T, pid: Pid) -> Vec<Signal> {
         if let Some(old) = self.states.remove(&pid) {
             self.reports
                 .push(old.archive("replaced by exec".to_string()));
         }
         self.images += 1;
         let mut process = Process::new(format!("image {} (pid {})", self.images, pid.as_raw()));
-        match install_hooks(tracer, pid) {
+        let mut pending_signals = Vec::new();
+        match install_hooks(tracer, pid, &mut pending_signals) {
             Ok(hook) => {
                 process.hook = Some(hook);
                 process.notes.push(
@@ -150,6 +152,7 @@ impl Monitor {
             Err(error) => process.notes.push(format!("not covered: {error:?}")),
         }
         self.states.insert(pid, process);
+        pending_signals
     }
 
     /// A process stopped at a trapped system call, which `syscall` names when

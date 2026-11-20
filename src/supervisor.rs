@@ -6,7 +6,7 @@
 //! All operating-system calls go through [`Tracer`], so the control flow can
 //! be tested with scripted results, including every error path.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -83,6 +83,11 @@ pub trait Tracer {
     /// Runs one instruction. If the stopped thread is at a trapped system call,
     /// the call completes instead of stopping again.
     fn step(&mut self, pid: Pid) -> nix::Result<()>;
+    /// Whether the current SIGTRAP stop is the completion of a single-step,
+    /// as opposed to a SIGTRAP signal sent to the target. A signal sent by a
+    /// process (`kill`, `tkill`, `sigqueue`) has `si_code <= 0`. A trap raised
+    /// by the kernel has a positive code.
+    fn is_single_step_trap(&mut self, pid: Pid) -> nix::Result<bool>;
     /// The new task's pid, reported with a fork, vfork or clone event.
     fn event_message(&mut self, pid: Pid) -> nix::Result<i64>;
     fn read_mem(&mut self, pid: Pid, addr: u64, len: usize) -> io::Result<Vec<u8>>;
@@ -154,6 +159,10 @@ impl Tracer for OsTracer {
         ptrace::step(pid, None)
     }
 
+    fn is_single_step_trap(&mut self, pid: Pid) -> nix::Result<bool> {
+        ptrace::getsiginfo(pid).map(|info| siginfo_is_single_step(info.si_code))
+    }
+
     fn event_message(&mut self, pid: Pid) -> nix::Result<i64> {
         ptrace::getevent(pid)
     }
@@ -205,6 +214,8 @@ struct Session<'t, 'l, T: Tracer> {
     early: BTreeSet<Pid>,
     /// Children named by their event before their initial stop arrived.
     announced: BTreeSet<Pid>,
+    redelivered: BTreeMap<Pid, VecDeque<Signal>>,
+    failed: bool,
 }
 
 impl<T: Tracer> Drop for Session<'_, '_, T> {
@@ -222,7 +233,11 @@ impl<T: Tracer> Session<'_, '_, T> {
         }
         self.drain();
         self.summarise();
-        self.root_code.unwrap_or(1)
+        if self.failed {
+            1
+        } else {
+            self.root_code.unwrap_or(1)
+        }
     }
 
     /// Waits for the stub's self-stop, attaches, and resumes it. Returns the
@@ -274,12 +289,14 @@ impl<T: Tracer> Session<'_, '_, T> {
                 if pid == self.stub {
                     self.root_code = Some(code);
                 }
+                self.redelivered.remove(&pid);
                 self.monitor.exited(pid, format!("exit code {code}"));
             }
             Event::Killed(pid, signal) => {
                 if pid == self.stub {
                     self.root_code = Some(128 + signal as i32);
                 }
+                self.redelivered.remove(&pid);
                 self.monitor.exited(pid, format!("killed by {signal}"));
             }
             Event::Trap(pid) => {
@@ -306,7 +323,21 @@ impl<T: Tracer> Session<'_, '_, T> {
             }
             Event::Exec(pid) => {
                 self.tracees.insert(pid);
-                self.monitor.exec(&mut *self.tracer, pid);
+                let pending_signals = self.monitor.exec(&mut *self.tracer, pid);
+                for signal in pending_signals {
+                    if let Err(error) = self.tracer.send_signal(pid, signal) {
+                        // ESRCH means the tracee is already gone, so there is nothing to deliver to.
+                        if error != Errno::ESRCH {
+                            self.failed = true;
+                            eprintln!(
+                                "leakgc: cannot re-queue {signal} for pid {}: {error}",
+                                pid.as_raw()
+                            );
+                        }
+                    } else {
+                        self.redelivered.entry(pid).or_default().push_back(signal);
+                    }
+                }
                 let _ = self.tracer.cont(pid, None);
             }
             Event::Fork(parent) => {
@@ -339,11 +370,22 @@ impl<T: Tracer> Session<'_, '_, T> {
                     }
                     return;
                 }
-                // SIGSTOP and SIGTRAP are ptrace's own stops, so they are not
-                // delivered to the target.
-                let pass = match signal {
-                    Signal::SIGSTOP | Signal::SIGTRAP => None,
-                    other => Some(other),
+                // Ptrace-owned SIGSTOP and SIGTRAP stops are suppressed unless
+                // this supervisor explicitly re-queued the target signal.
+                let deferred = self.redelivered.get_mut(&pid).and_then(|signals| {
+                    let index = signals.iter().position(|pending| *pending == signal)?;
+                    signals.remove(index)
+                });
+                if self.redelivered.get(&pid).is_some_and(VecDeque::is_empty) {
+                    self.redelivered.remove(&pid);
+                }
+                let pass = if deferred.is_some() {
+                    Some(signal)
+                } else {
+                    match signal {
+                        Signal::SIGSTOP | Signal::SIGTRAP => None,
+                        other => Some(other),
+                    }
                 };
                 let _ = self.tracer.cont(pid, pass);
             }
@@ -413,6 +455,8 @@ pub fn supervise_with<T: Tracer>(
         monitor: Monitor::default(),
         early: BTreeSet::new(),
         announced: BTreeSet::new(),
+        redelivered: BTreeMap::new(),
+        failed: false,
     };
     session.run()
 }
@@ -428,4 +472,20 @@ pub fn supervise(args: &[OsString]) -> i32 {
         None
     };
     supervise_with(&mut tracer, args, log)
+}
+
+fn siginfo_is_single_step(code: i32) -> bool {
+    code == libc::TRAP_TRACE || code == libc::TRAP_BRKPT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::siginfo_is_single_step;
+
+    #[test]
+    fn identifies_ptrace_step_codes_but_not_sent_signals() {
+        assert!(siginfo_is_single_step(libc::TRAP_TRACE));
+        assert!(siginfo_is_single_step(libc::TRAP_BRKPT));
+        assert!(!siginfo_is_single_step(libc::SI_TKILL));
+    }
 }
