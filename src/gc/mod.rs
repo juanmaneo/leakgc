@@ -3,6 +3,7 @@
 
 mod alloc;
 mod collect;
+pub mod conservative;
 mod demo;
 mod mark;
 mod report;
