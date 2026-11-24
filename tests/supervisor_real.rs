@@ -106,7 +106,7 @@ fn static_binary_reports_its_outstanding_blocks_by_caller() {
 /// `mmap` runs. `local` and `kept` still hold the other two. The fixture is
 /// built at -O0 so that `local` stays in main's frame. glibc's startup blocks
 /// that only RELRO data points to are also reported, because read-only memory
-/// is not scanned (PLAN §9). They are not asserted here.
+/// is not scanned (PLAN section 9). They are not asserted here.
 #[test]
 fn static_binary_reports_only_the_block_nothing_points_to() {
     let reach = build_c(
