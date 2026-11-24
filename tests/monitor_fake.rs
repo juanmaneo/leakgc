@@ -7,8 +7,8 @@ mod common;
 use std::collections::BTreeMap;
 
 use common::*;
-use leakgc::install::{DEFAULT_HINT, HEAD_OFFSET, RECORDS_OFFSET};
-use leakgc::ledger::{ImageReport, Site};
+use leakgc::install::{DEFAULT_HINT, HEAD_OFFSET, RECORDS_OFFSET, REGION_LEN};
+use leakgc::ledger::{ImageReport, Reachability, Site};
 use leakgc::monitor::Monitor;
 use leakgc::ring::{CAPACITY, Kind, RECORD_LEN, Record};
 use nix::unistd::Pid;
@@ -16,6 +16,9 @@ use nix::unistd::Pid;
 const CALLER: u64 = 0x40_1000;
 const CLONE_VM: u64 = 0x100;
 const SHARED_BLOCK: u64 = 0x6000_0000;
+/// The stack mapping. `initial_regs` puts `rsp` at 0x7fff_f000, inside it.
+const STACK: (u64, u64) = (0x7fff_e000, 0x7fff_f800);
+const RSP: u64 = 0x7fff_f000;
 
 /// A process whose hooks are installed, with the bytes the install wrote last.
 struct Hooked {
@@ -47,6 +50,8 @@ impl Hooked {
 fn hooked() -> Hooked {
     let mut fake = Fake::new(static_image(), vec![trap(), seccomp(), trap()]);
     let pristine = fake.mem.clone();
+    map_writable(&mut fake, STACK.0, STACK.1);
+    map_line(&mut fake, DEFAULT_HINT, DEFAULT_HINT + REGION_LEN, "rwxp");
     let mut monitor = Monitor::default();
     assert!(monitor.exec(&mut fake, pid()).is_empty());
     assert_eq!(fake.writes.len(), 9, "the install wrote every hook");
@@ -164,6 +169,10 @@ fn a_record_that_does_not_decode_stops_reading_and_drops_the_hooks() {
     let report = only(h.monitor.finish());
     assert_eq!(report.notes.len(), 3, "{:?}", report.notes);
     assert!(has_note(&report, "record 0 is corrupt"));
+    assert_eq!(
+        report.reachability,
+        Reachability::Incomplete("record 0 is corrupt".to_string())
+    );
 }
 
 #[test]
@@ -397,4 +406,179 @@ fn a_trap_from_an_unknown_process_is_ignored() {
 
     assert_eq!(fake.calls, 0);
     assert!(monitor.finish().is_empty());
+}
+
+#[test]
+fn a_checked_report_lists_the_blocks_that_nothing_reaches() {
+    let mut h = hooked();
+    map_writable(&mut h.fake, 0x7000, 0x9000);
+    set_head(&mut h.fake, 2);
+    write_slot(&mut h.fake, 0, malloc_record(16, 0x7000), true);
+    write_slot(&mut h.fake, 1, malloc_record(32, 0x8000), true);
+    put_word(&mut h.fake, RSP + 0x100, 0x7000);
+
+    h.monitor.trapped(&mut h.fake, pid(), None);
+
+    let report = only(h.monitor.finish());
+    assert_eq!(
+        report.reachability,
+        Reachability::Checked {
+            lost: vec![Site {
+                caller: CALLER,
+                blocks: 1,
+                bytes: 32
+            }]
+        }
+    );
+}
+
+#[test]
+fn a_clone_that_shares_memory_ends_the_reachability_checks() {
+    let mut h = hooked();
+    set_head(&mut h.fake, 0);
+    h.monitor.trapped(&mut h.fake, pid(), None);
+    h.fake.regs.rdi = CLONE_VM;
+
+    h.monitor.trapped(&mut h.fake, pid(), Some(libc::SYS_clone));
+
+    let report = only(h.monitor.finish());
+    assert!(matches!(
+        &report.reachability,
+        Reachability::Incomplete(reason) if reason.starts_with("threads started")
+    ));
+}
+
+#[test]
+fn an_unparsable_memory_map_is_reported_as_not_checked() {
+    let mut h = hooked();
+    set_head(&mut h.fake, 0);
+    h.fake.maps = "not a mapping\n".to_string();
+
+    h.monitor.trapped(&mut h.fake, pid(), None);
+
+    let report = only(h.monitor.finish());
+    assert_eq!(
+        report.reachability,
+        Reachability::Incomplete("the memory map cannot be parsed".to_string())
+    );
+}
+
+#[test]
+fn an_image_that_is_not_hooked_is_never_checked() {
+    let mut fake = Fake::new(dynamic_image(), vec![]);
+    let mut monitor = Monitor::default();
+    assert!(monitor.exec(&mut fake, pid()).is_empty());
+
+    monitor.trapped(&mut fake, pid(), None);
+
+    let report = only(monitor.finish());
+    assert_eq!(report.reachability, Reachability::Unchecked);
+}
+
+#[test]
+fn a_trap_inside_a_hooked_call_keeps_the_last_complete_check() {
+    let mut h = hooked();
+    set_head(&mut h.fake, 0);
+    h.monitor.trapped(&mut h.fake, pid(), None);
+    set_head(&mut h.fake, 1);
+    write_slot(&mut h.fake, 0, malloc_record(16, 0), false);
+    h.fake.maps = "not a mapping\n".to_string();
+
+    h.monitor.trapped(&mut h.fake, pid(), Some(libc::SYS_mmap));
+
+    let report = only(h.monitor.finish());
+    assert_eq!(report.reachability, Reachability::Checked { lost: vec![] });
+}
+
+#[test]
+fn an_unreadable_record_makes_that_check_incomplete() {
+    let mut h = hooked();
+    set_head(&mut h.fake, 1);
+    h.fake.fail_at = Some(h.fake.calls + 1);
+
+    h.monitor.trapped(&mut h.fake, pid(), None);
+
+    let report = only(h.monitor.finish());
+    assert_eq!(
+        report.reachability,
+        Reachability::Incomplete("cannot read the records: injected read failure".to_string())
+    );
+}
+
+#[test]
+fn a_later_drain_that_reads_the_records_gives_a_checked_result_again() {
+    let mut h = hooked();
+    set_head(&mut h.fake, 1);
+    write_slot(&mut h.fake, 0, malloc_record(16, 0x7000), true);
+    h.fake.fail_at = Some(h.fake.calls + 1);
+    h.monitor.trapped(&mut h.fake, pid(), None);
+
+    h.monitor.trapped(&mut h.fake, pid(), None);
+
+    let report = only(h.monitor.finish());
+    assert_eq!(
+        report.reachability,
+        Reachability::Checked {
+            lost: vec![Site {
+                caller: CALLER,
+                blocks: 1,
+                bytes: 16
+            }]
+        }
+    );
+}
+
+#[test]
+fn overwritten_records_make_every_later_check_incomplete() {
+    let mut h = hooked();
+    set_head(&mut h.fake, CAPACITY + 5);
+
+    h.monitor.trapped(&mut h.fake, pid(), None);
+    h.monitor.trapped(&mut h.fake, pid(), None);
+
+    let report = only(h.monitor.finish());
+    assert_eq!(
+        report.reachability,
+        Reachability::Incomplete("5 records were overwritten before they were read".to_string())
+    );
+}
+
+#[test]
+fn a_forked_child_inherits_a_check_of_the_memory_it_copies() {
+    let mut h = hooked();
+    map_writable(&mut h.fake, 0x7000, 0x8000);
+    set_head(&mut h.fake, 1);
+    write_slot(&mut h.fake, 0, malloc_record(16, 0x7000), true);
+
+    h.monitor.forked(&mut h.fake, pid(), Pid::from_raw(101));
+
+    let reports = h.monitor.finish();
+    let child = reports
+        .iter()
+        .find(|r| r.label == "image 1 (pid 100) forked as pid 101")
+        .expect("child report");
+    assert_eq!(
+        child.reachability,
+        Reachability::Checked {
+            lost: vec![Site {
+                caller: CALLER,
+                blocks: 1,
+                bytes: 16
+            }]
+        }
+    );
+}
+
+#[test]
+fn a_shared_clone_in_an_image_that_is_not_hooked_changes_nothing() {
+    let mut fake = Fake::new(dynamic_image(), vec![]);
+    let mut monitor = Monitor::default();
+    assert!(monitor.exec(&mut fake, pid()).is_empty());
+    fake.regs.rdi = CLONE_VM;
+
+    monitor.trapped(&mut fake, pid(), Some(libc::SYS_clone));
+
+    let report = only(monitor.finish());
+    assert_eq!(report.reachability, Reachability::Unchecked);
+    assert_eq!(report.notes.len(), 2, "{:?}", report.notes);
 }

@@ -1,9 +1,10 @@
 //! The blocks an image still holds, built from finished hooked calls (P2b-3a).
 //!
 //! A block is outstanding from the call that returned it until a call frees it.
-//! Nothing here checks whether a block is still reachable. That is P4.
+//! Reachability is not decided here. The monitor runs a scan and records its
+//! result in [`ImageReport`] (P4b, report only).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ring::{Kind, Record};
 
@@ -68,10 +69,27 @@ impl Ledger {
         }
     }
 
+    /// The start address and size of every outstanding block, in address order.
+    pub fn live_blocks(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.live.iter().map(|(&start, block)| (start, block.size))
+    }
+
     /// Outstanding blocks grouped by the call site that allocated them, by address.
     pub fn sites(&self) -> Vec<Site> {
+        self.group(|_| true)
+    }
+
+    /// Outstanding blocks whose start is not in `reached`, grouped by call site.
+    pub fn unreached_sites(&self, reached: &BTreeSet<u64>) -> Vec<Site> {
+        self.group(|start| !reached.contains(&start))
+    }
+
+    fn group(&self, keep: impl Fn(u64) -> bool) -> Vec<Site> {
         let mut by_caller: BTreeMap<u64, Site> = BTreeMap::new();
-        for block in self.live.values() {
+        for (&start, block) in &self.live {
+            if !keep(start) {
+                continue;
+            }
             let site = by_caller.entry(block.caller).or_insert(Site {
                 caller: block.caller,
                 blocks: 0,
@@ -88,6 +106,19 @@ impl Ledger {
     }
 }
 
+/// What the last reachability check found (P4b). The check is report only:
+/// nothing is freed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Reachability {
+    /// No check has completed for this image.
+    #[default]
+    Unchecked,
+    /// The scan completed. `lost` lists the outstanding blocks that nothing reached.
+    Checked { lost: Vec<Site> },
+    /// The scan could not complete, so no result is claimed. The reason is given.
+    Incomplete(String),
+}
+
 /// The report for one process image, printed when it ends (or is replaced).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageReport {
@@ -95,6 +126,7 @@ pub struct ImageReport {
     pub sites: Vec<Site>,
     pub unknown_frees: u64,
     pub notes: Vec<String>,
+    pub reachability: Reachability,
 }
 
 impl ImageReport {
@@ -104,6 +136,7 @@ impl ImageReport {
             sites: ledger.sites(),
             unknown_frees: ledger.unknown_frees(),
             notes,
+            reachability: Reachability::Unchecked,
         }
     }
 
@@ -111,12 +144,23 @@ impl ImageReport {
     pub fn lines(&self) -> Vec<String> {
         let blocks: u64 = self.sites.iter().map(|site| site.blocks).sum();
         let bytes: u64 = self.sites.iter().map(|site| site.bytes).sum();
-        let mut lines = vec![format!(
-            "{}: {blocks} blocks, {bytes} bytes outstanding (not yet checked for reachability, P4)",
-            self.label
-        )];
+        let mut lines = vec![self.header(blocks, bytes)];
         for note in &self.notes {
             lines.push(format!("  note: {note}"));
+        }
+        match &self.reachability {
+            Reachability::Unchecked => {}
+            Reachability::Checked { lost } => {
+                for site in lost {
+                    lines.push(format!(
+                        "  unreachable caller 0x{:x}: {} blocks, {} bytes",
+                        site.caller, site.blocks, site.bytes
+                    ));
+                }
+            }
+            Reachability::Incomplete(reason) => {
+                lines.push(format!("  reachability not checked: {reason}"));
+            }
         }
         for site in &self.sites {
             lines.push(format!(
@@ -128,5 +172,23 @@ impl ImageReport {
             lines.push(format!("  unknown frees: {}", self.unknown_frees));
         }
         lines
+    }
+
+    fn header(&self, blocks: u64, bytes: u64) -> String {
+        let outstanding = format!("{blocks} blocks, {bytes} bytes outstanding");
+        match &self.reachability {
+            Reachability::Checked { lost } => {
+                let lost_blocks: u64 = lost.iter().map(|site| site.blocks).sum();
+                let lost_bytes: u64 = lost.iter().map(|site| site.bytes).sum();
+                format!(
+                    "{}: {outstanding}; {lost_blocks} blocks, {lost_bytes} bytes unreachable at the last check (P4, report only)",
+                    self.label
+                )
+            }
+            Reachability::Unchecked | Reachability::Incomplete(_) => format!(
+                "{}: {outstanding} (not checked for reachability, P4)",
+                self.label
+            ),
+        }
     }
 }

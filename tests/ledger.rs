@@ -1,4 +1,6 @@
-use leakgc::ledger::{ImageReport, Ledger, Site};
+use std::collections::BTreeSet;
+
+use leakgc::ledger::{ImageReport, Ledger, Reachability, Site};
 use leakgc::ring::{Kind, Record};
 
 const A: u64 = 0xa;
@@ -170,7 +172,7 @@ fn a_report_lists_its_totals_notes_sites_and_unknown_frees() {
     assert_eq!(
         report.lines(),
         vec![
-            "image 1 (pid 100): 3 blocks, 56 bytes outstanding (not yet checked for reachability, P4)",
+            "image 1 (pid 100): 3 blocks, 56 bytes outstanding (not checked for reachability, P4)",
             "  note: hooked",
             "  caller 0xa: 2 blocks, 48 bytes",
             "  caller 0xb: 1 blocks, 8 bytes",
@@ -185,8 +187,92 @@ fn an_empty_report_has_only_its_header() {
 
     assert_eq!(
         report.lines(),
+        vec!["image 2 (pid 7): 0 blocks, 0 bytes outstanding (not checked for reachability, P4)"]
+    );
+}
+
+#[test]
+fn live_blocks_lists_every_outstanding_block_in_address_order() {
+    let mut ledger = Ledger::default();
+    ledger.apply(malloc(A, 16, 0x2000));
+    ledger.apply(malloc(B, 8, 0x1000));
+    ledger.apply(malloc(A, 32, 0x3000));
+    ledger.apply(free(B, 0x3000));
+
+    assert_eq!(
+        ledger.live_blocks().collect::<Vec<_>>(),
+        vec![(0x1000, 8), (0x2000, 16)]
+    );
+}
+
+#[test]
+fn unreached_sites_keeps_the_blocks_whose_start_is_not_reached() {
+    let mut ledger = Ledger::default();
+    ledger.apply(malloc(A, 16, 0x1000));
+    ledger.apply(malloc(A, 32, 0x2000));
+    ledger.apply(malloc(B, 8, 0x3000));
+
+    assert_eq!(
+        ledger.unreached_sites(&BTreeSet::from([0x2000])),
+        vec![site(A, 1, 16), site(B, 1, 8)]
+    );
+}
+
+#[test]
+fn a_checked_report_says_what_nothing_reaches() {
+    let mut ledger = Ledger::default();
+    ledger.apply(malloc(A, 16, 0x1000));
+    ledger.apply(malloc(B, 8, 0x2000));
+    let mut report = ImageReport::new(
+        "image 1 (pid 100)".to_string(),
+        &ledger,
+        vec!["hooked".to_string()],
+    );
+    report.reachability = Reachability::Checked {
+        lost: vec![site(B, 1, 8)],
+    };
+
+    assert_eq!(
+        report.lines(),
         vec![
-            "image 2 (pid 7): 0 blocks, 0 bytes outstanding (not yet checked for reachability, P4)"
+            "image 1 (pid 100): 2 blocks, 24 bytes outstanding; 1 blocks, 8 bytes unreachable at the last check (P4, report only)",
+            "  note: hooked",
+            "  unreachable caller 0xb: 1 blocks, 8 bytes",
+            "  caller 0xa: 1 blocks, 16 bytes",
+            "  caller 0xb: 1 blocks, 8 bytes",
+        ]
+    );
+}
+
+#[test]
+fn a_checked_report_with_nothing_unreachable_says_so() {
+    let mut ledger = Ledger::default();
+    ledger.apply(malloc(A, 16, 0x1000));
+    let mut report = ImageReport::new("image 1 (pid 100)".to_string(), &ledger, vec![]);
+    report.reachability = Reachability::Checked { lost: vec![] };
+
+    assert_eq!(
+        report.lines(),
+        vec![
+            "image 1 (pid 100): 1 blocks, 16 bytes outstanding; 0 blocks, 0 bytes unreachable at the last check (P4, report only)",
+            "  caller 0xa: 1 blocks, 16 bytes",
+        ]
+    );
+}
+
+#[test]
+fn a_report_whose_check_failed_claims_nothing_and_gives_the_reason() {
+    let mut ledger = Ledger::default();
+    ledger.apply(malloc(A, 16, 0x1000));
+    let mut report = ImageReport::new("image 1 (pid 100)".to_string(), &ledger, vec![]);
+    report.reachability = Reachability::Incomplete("the memory map cannot be parsed".to_string());
+
+    assert_eq!(
+        report.lines(),
+        vec![
+            "image 1 (pid 100): 1 blocks, 16 bytes outstanding (not checked for reachability, P4)",
+            "  reachability not checked: the memory map cannot be parsed",
+            "  caller 0xa: 1 blocks, 16 bytes",
         ]
     );
 }

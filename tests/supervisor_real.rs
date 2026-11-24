@@ -102,6 +102,40 @@ fn static_binary_reports_its_outstanding_blocks_by_caller() {
     assert!(!log.contains("unknown frees"), "log:\n{log}");
 }
 
+/// The 333-byte block is the only one nothing points to when the trapped
+/// `mmap` runs. `local` and `kept` still hold the other two. The fixture is
+/// built at -O0 so that `local` stays in main's frame. glibc's startup blocks
+/// that only RELRO data points to are also reported, because read-only memory
+/// is not scanned (PLAN §9). They are not asserted here.
+#[test]
+fn static_binary_reports_only_the_block_nothing_points_to() {
+    let reach = build_c(
+        "reach_static.c",
+        &["-static", "-no-pie", "-O0", "-fno-builtin"],
+    );
+    let path = reach.to_str().expect("UTF-8 path");
+    let (status, log) = run_leakgc(&[path], &[("LEAKGC_LOG", "1")]);
+
+    assert_eq!(status.code(), Some(0), "log:\n{log}");
+    assert!(log.contains("unreachable at the last check"), "log:\n{log}");
+    let unreachable: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("unreachable caller"))
+        .collect();
+    assert!(
+        unreachable
+            .iter()
+            .any(|line| line.ends_with("1 blocks, 333 bytes")),
+        "log:\n{log}"
+    );
+    assert!(
+        unreachable
+            .iter()
+            .all(|line| !line.ends_with("777 bytes") && !line.ends_with("555 bytes")),
+        "log:\n{log}"
+    );
+}
+
 #[test]
 fn background_jobs_are_waited_for() {
     let (status, _) = run_leakgc(&["sh", "-c", "sleep 0.1 & wait"], &[]);
