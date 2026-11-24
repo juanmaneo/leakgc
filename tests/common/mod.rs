@@ -93,6 +93,7 @@ pub struct Fake {
     pub fail_at: Option<usize>,
     pub calls: usize,
     pub writes: Vec<(u64, Vec<u8>)>,
+    pub maps: String,
 }
 
 impl Fake {
@@ -126,6 +127,7 @@ impl Fake {
             fail_at: None,
             calls: 0,
             writes: Vec::new(),
+            maps: String::new(),
         }
     }
 
@@ -184,7 +186,10 @@ impl Tracer for Fake {
     }
 
     fn read_maps(&mut self, _pid: Pid) -> io::Result<String> {
-        unreachable!("install reads the image, not the maps")
+        if self.fails() {
+            return Err(io::Error::other("injected maps failure"));
+        }
+        Ok(self.maps.clone())
     }
 
     fn exe_image(&mut self, _pid: Pid) -> io::Result<Vec<u8>> {
@@ -258,6 +263,26 @@ impl Tracer for Fake {
         self.writes.push((addr, bytes.to_vec()));
         Ok(())
     }
+}
+
+/// Adds a mapping line to the fake's memory map without any bytes behind it.
+/// Reading an address without bytes fails, so the test decides which ranges are readable.
+pub fn map_line(fake: &mut Fake, start: u64, end: u64, perms: &str) {
+    fake.maps
+        .push_str(&format!("{start:x}-{end:x} {perms} 00000000 00:00 0\n"));
+}
+
+/// Adds a writable mapping whose bytes are all zero, so every byte can be read.
+pub fn map_writable(fake: &mut Fake, start: u64, end: u64) {
+    map_line(fake, start, end, "rw-p");
+    for addr in start..end {
+        fake.mem.entry(addr).or_insert(0);
+    }
+}
+
+/// Writes one little-endian word at `addr`.
+pub fn put_word(fake: &mut Fake, addr: u64, value: u64) {
+    fake.poke(addr, &value.to_le_bytes());
 }
 
 pub fn build_c(out_name: &str, flags: &[&str]) -> Vec<u8> {

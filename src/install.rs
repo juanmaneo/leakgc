@@ -44,7 +44,8 @@ const BLOCK_LEN: u64 = 0x200;
 /// Where the displaced instructions start within a block. The entry trampoline
 /// must assemble to fewer bytes than this.
 const DISPLACED_OFFSET: u64 = 0x180;
-const REGION_LEN: u64 = RECORDS_OFFSET + CAPACITY * RECORD_LEN as u64;
+/// The hook region's length. Reachability scans skip this mapping (P4b).
+pub const REGION_LEN: u64 = RECORDS_OFFSET + CAPACITY * RECORD_LEN as u64;
 const INDEX_MASK: i32 = (CAPACITY - 1) as i32;
 const PROT_RWX: u64 = 0x7;
 /// `MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE`.
