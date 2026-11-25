@@ -15,7 +15,7 @@ Investigated and not used: **Cosmopolitan Libc** (ISC). It does not intercept sy
 
 ## Shipped code
 
-The shipped binary is built from the following crates. The list comes from `cargo tree --locked -p leakgc --edges normal` and `cargo metadata` on the current `Cargo.lock`.
+The shipped binary is built from the following crates. The list comes from `cargo tree --locked -p leakgc --edges normal` and `cargo metadata` on the current `Cargo.lock`. The one exception is `cfg_aliases`, which is a `[build-dependencies]` entry of `nix`, so it does not appear on the normal-edge graph.
 
 | Crate | Version | License | Kind |
 |---|---|---|---|
