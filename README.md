@@ -17,9 +17,9 @@ It does not use `LD_PRELOAD`. The program runs natively. A seccomp filter traps 
 Early work. Steps 1 and 2 exist, in part. Nothing is freed yet.
 
 - Traces `mmap`, `munmap`, `mremap`, `brk`, `clone`, `clone3` and `execve`, and passes everything else through to the kernel.
-- Hooks `malloc`, `free` and `realloc` in **static, non-PIE glibc** programs and keeps a ledger of the blocks still outstanding. With `LEAKGC_LOG` set, it prints that ledger. This is a debugging aid for the later steps.
-- At each trapped call, checks which outstanding blocks the process still reaches from its registers and writable memory. This is report only: `LEAKGC_LOG` prints the result, and nothing is freed. Read-only memory is not scanned, so some glibc startup blocks are reported as unreachable (see `PLAN.md`, R29 and D51).
-- Not built: the count-based trigger and the free (P4 remainder and P5), threads, dynamic and PIE binaries, stripped binaries, other allocators.
+- Hooks the eight allocator entry points of **static, non-PIE glibc** programs (`malloc`, `free`, `realloc`, `calloc`, `memalign`, `aligned_alloc`, `valloc` and `pvalloc`) and keeps a ledger of the blocks still outstanding. `posix_memalign` is not hooked. With `LEAKGC_LOG` set, it prints that ledger. This is a debugging aid for the later steps.
+- Once 64 allocations have been counted since the last check, the next trapped call checks which outstanding blocks the process still reaches from its registers, writable memory and readable data. This is report only: `LEAKGC_LOG` prints the result, and nothing is freed. Executable code is not scanned (see `PLAN.md`, R35). A process that makes fewer than 64 allocations is not checked, and its report says so.
+- Not built: freeing (P5), threads, dynamic and PIE binaries, stripped binaries, other allocators.
 
 Freeing memory the program still uses corrupts it. The design is fail-closed: a block that cannot be seen, or is not understood, is never freed. See `PLAN.md` (risks R1 to R3) for what that does and does not guarantee.
 
