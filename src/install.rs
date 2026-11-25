@@ -1,4 +1,4 @@
-//! Installs the E4 entry hooks on `malloc`, `free` and `realloc` in a stopped,
+//! Installs the E4 entry hooks on the glibc allocator entries in a stopped,
 //! static, non-PIE process (PLAN 4.6). It runs at the exec-stop, before the
 //! target executes anything.
 //!
@@ -38,7 +38,7 @@ pub const RECORDS_OFFSET: u64 = 0x3_0000;
 
 const DEPTH_OFFSET: u64 = HEAD_OFFSET + 8;
 const PENDING_OFFSET: u64 = 0x2_0000;
-const EXIT_OFFSET: u64 = 0x800;
+const EXIT_OFFSET: u64 = 0x1000;
 /// Each hook's entry trampoline, displaced instructions and tail share one block.
 const BLOCK_LEN: u64 = 0x200;
 /// Where the displaced instructions start within a block. The entry trampoline
@@ -61,6 +61,7 @@ const LAYOUT: &str = "block code fits its slot";
 const _: () = assert!(RECORD_LEN == 64);
 const _: () = assert!(PENDING_OFFSET + 0x1_0000 == RECORDS_OFFSET);
 const _: () = assert!(DEPTH_OFFSET + 8 <= PENDING_OFFSET);
+const _: () = assert!(HOOKS.len() as u64 * BLOCK_LEN <= EXIT_OFFSET);
 
 /// One hooked function: its symbol, what its record holds, and its block.
 struct Hook {
@@ -69,7 +70,11 @@ struct Hook {
     block: u64,
 }
 
-const HOOKS: [Hook; 3] = [
+/// `calloc`, `memalign`, `aligned_alloc`, `valloc` and `pvalloc` call glibc's
+/// internal `_int_malloc` or `_int_memalign`, not the hooked `malloc`, so they
+/// are hooked on their own. Otherwise their blocks are never recorded, and a
+/// trap inside them would look like a safe point (PLAN 4.8, D54).
+const HOOKS: [Hook; 8] = [
     Hook {
         symbol: "malloc",
         kind: Kind::Malloc,
@@ -84,6 +89,31 @@ const HOOKS: [Hook; 3] = [
         symbol: "realloc",
         kind: Kind::Realloc,
         block: 2 * BLOCK_LEN,
+    },
+    Hook {
+        symbol: "calloc",
+        kind: Kind::Calloc,
+        block: 3 * BLOCK_LEN,
+    },
+    Hook {
+        symbol: "memalign",
+        kind: Kind::Memalign,
+        block: 4 * BLOCK_LEN,
+    },
+    Hook {
+        symbol: "aligned_alloc",
+        kind: Kind::Memalign,
+        block: 5 * BLOCK_LEN,
+    },
+    Hook {
+        symbol: "valloc",
+        kind: Kind::Valloc,
+        block: 6 * BLOCK_LEN,
+    },
+    Hook {
+        symbol: "pvalloc",
+        kind: Kind::Valloc,
+        block: 7 * BLOCK_LEN,
     },
 ];
 
@@ -480,9 +510,11 @@ fn entry_code(base: u64, block: u64, kind: Kind) -> Vec<u8> {
 /// `(size, pointer argument)`.
 fn captured(kind: Kind) -> (Option<AsmRegister64>, Option<AsmRegister64>) {
     match kind {
-        Kind::Malloc => (Some(rdi), None),
+        Kind::Malloc | Kind::Valloc => (Some(rdi), None),
         Kind::Free => (None, Some(rdi)),
         Kind::Realloc => (Some(rsi), Some(rdi)),
+        Kind::Calloc => (Some(rdi), Some(rsi)),
+        Kind::Memalign => (Some(rsi), None),
     }
 }
 

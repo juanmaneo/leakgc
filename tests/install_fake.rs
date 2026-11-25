@@ -117,10 +117,10 @@ fn installs_the_jumps_last_in_hook_order() {
     let installed = install_hooks(&mut fake, pid()).expect("installs");
 
     assert_eq!(installed.base, DEFAULT_HINT);
-    assert_eq!(installed.patches.len(), 3, "malloc, free and realloc");
-    let blocks = [0, 0x200, 0x400];
+    assert_eq!(installed.patches.len(), 8, "eight allocator entries");
+    let blocks: Vec<u64> = (0..8).map(|i| i * 0x200).collect();
     let writes = &fake.writes;
-    assert_eq!(writes.len(), 2 + blocks.len() + 1 + 3, "write count");
+    assert_eq!(writes.len(), 2 + blocks.len() + 1 + 8, "write count");
     assert_eq!(writes[0], (rip, SYSCALL.to_vec()), "syscall bytes");
     assert_eq!(writes[1].0, rip, "syscall bytes restored");
     for (i, block) in blocks.iter().enumerate() {
@@ -128,11 +128,11 @@ fn installs_the_jumps_last_in_hook_order() {
         assert_eq!(*addr, DEFAULT_HINT + block, "entry block {i}");
         assert_eq!(code.len(), 0x200, "block {i} is written whole");
     }
-    assert_eq!(writes[5].0, DEFAULT_HINT + 0x800, "exit stub");
+    assert_eq!(writes[10].0, DEFAULT_HINT + 0x1000, "exit stub");
     for (i, patch) in installed.patches.iter().enumerate() {
         let jump = jmp_rel32(patch.at, DEFAULT_HINT + blocks[i]).expect("in reach");
         assert_eq!(
-            writes[6 + i],
+            writes[11 + i],
             (patch.at, jump.to_vec()),
             "jump {i} is written last, in hook order"
         );

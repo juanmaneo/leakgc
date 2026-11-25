@@ -34,7 +34,13 @@ impl Ledger {
     /// Applies one finished call, in the order the process made it.
     pub fn apply(&mut self, record: Record) {
         match record.kind {
-            Kind::Malloc => self.insert(record),
+            Kind::Malloc | Kind::Memalign | Kind::Valloc => self.insert(record),
+            // calloc returns NULL when the product overflows, so a block it
+            // returned has an exact product, and the wrapping multiply is safe.
+            Kind::Calloc => self.insert(Record {
+                size: record.size.wrapping_mul(record.arg),
+                ..record
+            }),
             Kind::Free => {
                 if record.arg != 0 {
                     self.release(record.arg);

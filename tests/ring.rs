@@ -35,7 +35,13 @@ fn a_finished_record_decodes_its_five_words_and_ignores_padding() {
 
 #[test]
 fn each_hooked_function_has_its_own_kind() {
-    for (word, kind) in [(2, Kind::Free), (3, Kind::Realloc)] {
+    for (word, kind) in [
+        (2, Kind::Free),
+        (3, Kind::Realloc),
+        (4, Kind::Calloc),
+        (5, Kind::Memalign),
+        (6, Kind::Valloc),
+    ] {
         let bytes = slot(0, 0x10, 0x20, 0x30, word, 1);
         assert_eq!(
             decode(&bytes),
@@ -58,7 +64,7 @@ fn a_slot_whose_call_has_not_returned_is_open() {
 
 #[test]
 fn a_slot_with_an_unknown_kind_is_corrupt() {
-    for word in [0, 4, u64::MAX] {
+    for word in [0, 7, u64::MAX] {
         assert_eq!(decode(&slot(0, 0, 0, 0, word, 1)), None, "kind {word}");
     }
 }

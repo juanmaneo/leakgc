@@ -212,7 +212,7 @@ impl Monitor {
             Ok(hook) => {
                 process.hook = Some(hook);
                 process.notes.push(
-                    "hooked malloc, free and realloc; allocations after the last trapped call are not read (D34)"
+                    "hooked malloc, free, realloc, calloc, memalign, aligned_alloc, valloc and pvalloc; allocations after the last trapped call are not read (D34)"
                         .to_string(),
                 );
             }

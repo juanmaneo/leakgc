@@ -24,7 +24,7 @@ const RSP: u64 = 0x7fff_f000;
 struct Hooked {
     monitor: Monitor,
     fake: Fake,
-    /// The three jumps and the bytes each one holds after the install.
+    /// The eight jumps and the bytes each one holds after the install.
     jumps: Vec<(u64, Vec<u8>)>,
     /// The memory before the install, which holds the bytes a restore must bring back.
     pristine: BTreeMap<u64, u8>,
@@ -54,8 +54,8 @@ fn hooked() -> Hooked {
     map_line(&mut fake, DEFAULT_HINT, DEFAULT_HINT + REGION_LEN, "rwxp");
     let mut monitor = Monitor::default();
     assert!(monitor.exec(&mut fake, pid()).is_empty());
-    assert_eq!(fake.writes.len(), 9, "the install wrote every hook");
-    let jumps = fake.writes[6..]
+    assert_eq!(fake.writes.len(), 19, "the install wrote every hook");
+    let jumps = fake.writes[11..]
         .iter()
         .map(|(at, bytes)| (*at, bytes.clone()))
         .collect();

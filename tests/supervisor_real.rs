@@ -92,7 +92,9 @@ fn static_binary_reports_its_outstanding_blocks_by_caller() {
 
     assert_eq!(status.code(), Some(0), "log:\n{log}");
     assert!(
-        log.contains("hooked malloc, free and realloc"),
+        log.contains(
+            "hooked malloc, free, realloc, calloc, memalign, aligned_alloc, valloc and pvalloc"
+        ),
         "log:\n{log}"
     );
     assert!(log.contains("1 blocks, 200 bytes"), "log:\n{log}");
@@ -100,6 +102,24 @@ fn static_binary_reports_its_outstanding_blocks_by_caller() {
     assert!(log.contains("exit code 0"), "log:\n{log}");
     assert!(!log.contains("not covered"), "log:\n{log}");
     assert!(!log.contains("unknown frees"), "log:\n{log}");
+}
+
+/// Each entry point the hooks cover reports its own block. `calloc` reports
+/// count times element size, and the freed `memalign` block is gone.
+#[test]
+fn static_binary_records_every_hooked_allocator_entry() {
+    let allocators = build_c("allocators_static.c", &["-static", "-no-pie"]);
+    let path = allocators.to_str().expect("UTF-8 path");
+    let (status, log) = run_leakgc(&[path], &[("LEAKGC_LOG", "1")]);
+
+    assert_eq!(status.code(), Some(0), "log:\n{log}");
+    assert!(!log.contains("not covered"), "log:\n{log}");
+    assert!(!log.contains("unknown frees"), "log:\n{log}");
+    assert!(log.contains("1 blocks, 120 bytes"), "log:\n{log}");
+    assert!(log.contains("1 blocks, 128 bytes"), "log:\n{log}");
+    assert!(log.contains("1 blocks, 10 bytes"), "log:\n{log}");
+    assert!(log.contains("1 blocks, 20 bytes"), "log:\n{log}");
+    assert!(!log.contains("1 blocks, 100 bytes"), "log:\n{log}");
 }
 
 /// The 333-byte block is the only one nothing points to when the trapped

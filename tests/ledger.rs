@@ -36,6 +36,26 @@ fn realloc(caller: u64, ptr: u64, size: u64, result: u64) -> Record {
     }
 }
 
+fn calloc(caller: u64, count: u64, elem: u64, result: u64) -> Record {
+    Record {
+        kind: Kind::Calloc,
+        size: count,
+        caller,
+        arg: elem,
+        result,
+    }
+}
+
+fn aligned(kind: Kind, caller: u64, size: u64, result: u64) -> Record {
+    Record {
+        kind,
+        size,
+        caller,
+        arg: 0,
+        result,
+    }
+}
+
 fn site(caller: u64, blocks: u64, bytes: u64) -> Site {
     Site {
         caller,
@@ -50,6 +70,34 @@ fn a_malloc_holds_a_block_for_its_caller() {
     ledger.apply(malloc(A, 16, 0x1000));
 
     assert_eq!(ledger.sites(), vec![site(A, 1, 16)]);
+    assert_eq!(ledger.unknown_frees(), 0);
+}
+
+#[test]
+fn a_calloc_holds_its_count_times_its_element_size() {
+    let mut ledger = Ledger::default();
+    ledger.apply(calloc(A, 3, 40, 0x1000));
+
+    assert_eq!(ledger.sites(), vec![site(A, 1, 120)]);
+}
+
+#[test]
+fn a_calloc_that_returned_null_holds_nothing() {
+    let mut ledger = Ledger::default();
+    ledger.apply(calloc(A, 3, 40, 0));
+
+    assert_eq!(ledger.sites(), vec![]);
+}
+
+#[test]
+fn memalign_and_valloc_hold_their_size_and_free_releases_them() {
+    let mut ledger = Ledger::default();
+    ledger.apply(aligned(Kind::Memalign, A, 100, 0x2000));
+    ledger.apply(aligned(Kind::Valloc, B, 10, 0x3000));
+    assert_eq!(ledger.sites(), vec![site(A, 1, 100), site(B, 1, 10)]);
+
+    ledger.apply(free(A, 0x2000));
+    assert_eq!(ledger.sites(), vec![site(B, 1, 10)]);
     assert_eq!(ledger.unknown_frees(), 0);
 }
 

@@ -13,11 +13,16 @@ pub const CAPACITY: u64 = 1 << 20;
 pub const RECORD_LEN: usize = 64;
 
 /// Which hooked function a record came from. The trampolines store these values.
+/// `Memalign` covers `memalign` and `aligned_alloc`, which take the size second.
+/// `Valloc` covers `valloc` and `pvalloc`, which take only the size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Malloc = 1,
     Free = 2,
     Realloc = 3,
+    Calloc = 4,
+    Memalign = 5,
+    Valloc = 6,
 }
 
 impl Kind {
@@ -26,13 +31,17 @@ impl Kind {
             1 => Some(Kind::Malloc),
             2 => Some(Kind::Free),
             3 => Some(Kind::Realloc),
+            4 => Some(Kind::Calloc),
+            5 => Some(Kind::Memalign),
+            6 => Some(Kind::Valloc),
             _ => None,
         }
     }
 }
 
 /// A finished hooked call. `size` is the requested size, `arg` is the pointer
-/// the call was given (zero when none), and `result` is what it returned.
+/// the call was given (zero when none), and `result` is what it returned. For
+/// `Calloc`, `size` is the element count and `arg` is the element size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Record {
     pub kind: Kind,
