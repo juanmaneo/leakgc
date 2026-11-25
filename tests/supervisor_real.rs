@@ -105,8 +105,8 @@ fn static_binary_reports_its_outstanding_blocks_by_caller() {
 /// The 333-byte block is the only one nothing points to when the trapped
 /// `mmap` runs. `local` and `kept` still hold the other two. The fixture is
 /// built at -O0 so that `local` stays in main's frame. glibc's startup blocks
-/// that only RELRO data points to are also reported, because read-only memory
-/// is not scanned (PLAN section 9). They are not asserted here.
+/// are referenced from RELRO data, which is read-only after startup. Read-only
+/// mappings are roots (D51), so those blocks must not be reported.
 #[test]
 fn static_binary_reports_only_the_block_nothing_points_to() {
     let reach = build_c(
@@ -122,16 +122,9 @@ fn static_binary_reports_only_the_block_nothing_points_to() {
         .lines()
         .filter(|line| line.contains("unreachable caller"))
         .collect();
+    assert_eq!(unreachable.len(), 1, "log:\n{log}");
     assert!(
-        unreachable
-            .iter()
-            .any(|line| line.ends_with("1 blocks, 333 bytes")),
-        "log:\n{log}"
-    );
-    assert!(
-        unreachable
-            .iter()
-            .all(|line| !line.ends_with("777 bytes") && !line.ends_with("555 bytes")),
+        unreachable[0].ends_with("1 blocks, 333 bytes"),
         "log:\n{log}"
     );
 }

@@ -1,8 +1,8 @@
 //! Which outstanding blocks a stopped process still reaches (P4b). Report only:
 //! nothing is freed from here.
 //!
-//! The roots are the registers and every writable mapping, with three
-//! exclusions. The hook region is skipped, because its records hold the
+//! The roots are the registers, every writable mapping and every readable,
+//! non-executable mapping (D51), with three exclusions. The hook region is skipped, because its records hold the
 //! pointers the ledger was built from. Outstanding blocks are skipped, so a
 //! block is kept only by something outside the heap bookkeeping, and a leaked
 //! block that points at another block does not keep it alive. Below the stack
@@ -20,7 +20,7 @@ use libc::user_regs_struct;
 use nix::unistd::Pid;
 
 use crate::gc::conservative::{Object, Words, mark};
-use crate::maps::writable_ranges;
+use crate::maps::scan_ranges;
 use crate::supervisor::Tracer;
 
 /// The x86-64 red zone: leaf functions may keep live data this far below `rsp`.
@@ -41,9 +41,10 @@ pub fn reachable<T: Tracer>(
     let maps = tracer
         .read_maps(pid)
         .map_err(|error| format!("cannot read the memory map: {error}"))?;
-    let mut writable = writable_ranges(&maps)
-        .filter(|ranges| !ranges.is_empty())
+    let ranges = scan_ranges(&maps)
+        .filter(|ranges| !ranges.roots.is_empty())
         .ok_or("the memory map cannot be parsed")?;
+    let mut writable = ranges.writable;
     writable.sort_unstable();
     let regs = tracer
         .regs(pid)
@@ -66,13 +67,12 @@ pub fn reachable<T: Tracer>(
     let excluded = coalesce(excluded);
 
     let mut roots = vec![Words::Read(register_words(&regs))];
-    for (start, end) in root_ranges(&writable, regs.rsp, &excluded) {
+    for (start, end) in root_ranges(&ranges.roots, regs.rsp, &excluded) {
         let mut at = start;
         while at < end {
             let len = (end - at).min(CHUNK);
-            let words = words(tracer, pid, at, len).map_err(|error| {
-                format!("a writable range could not be read at 0x{at:x}: {error}")
-            })?;
+            let words = words(tracer, pid, at, len)
+                .map_err(|error| format!("a root range could not be read at 0x{at:x}: {error}"))?;
             roots.push(Words::Read(words));
             at += len;
         }
@@ -122,12 +122,12 @@ fn register_words(regs: &user_regs_struct) -> Vec<u64> {
     ]
 }
 
-/// The word-aligned address ranges to scan as roots: the writable mappings
-/// minus the excluded intervals. In the mapping that holds `rsp`, scanning
-/// starts at the red zone.
-fn root_ranges(writable: &[(u64, u64)], rsp: u64, excluded: &[(u64, u64)]) -> Vec<(u64, u64)> {
+/// The word-aligned address ranges to scan as roots: the root mappings minus
+/// the excluded intervals. In the mapping that holds `rsp`, scanning starts at
+/// the red zone.
+fn root_ranges(roots: &[(u64, u64)], rsp: u64, excluded: &[(u64, u64)]) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
-    for &(start, end) in writable {
+    for &(start, end) in roots {
         let start = if (start..end).contains(&rsp) {
             rsp.saturating_sub(RED_ZONE).max(start)
         } else {

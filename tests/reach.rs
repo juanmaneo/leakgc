@@ -271,16 +271,70 @@ fn a_reached_block_whose_bytes_cannot_be_read_is_an_error() {
 }
 
 #[test]
-fn a_writable_range_whose_bytes_cannot_be_read_is_an_error() {
+fn a_root_range_whose_bytes_cannot_be_read_is_an_error() {
     let mut fake = scene();
     map_line(&mut fake, 0x6400_0000, 0x6400_1000, "rw-p");
 
     let error = scan(&mut fake, &[]).expect_err("the range cannot be read");
 
     assert!(
-        error.starts_with("a writable range could not be read at 0x64000000"),
+        error.starts_with("a root range could not be read at 0x64000000"),
         "{error}"
     );
+}
+
+const READ_ONLY: (u64, u64) = (0x5000_0000, 0x5000_1000);
+const CODE: (u64, u64) = (0x5000_2000, 0x5000_3000);
+const VVAR: (u64, u64) = (0x5000_4000, 0x5000_5000);
+
+/// A mapping whose bytes are all present, so it can be read.
+fn filled_mapping(fake: &mut Fake, start: u64, end: u64, perms: &str) {
+    map_line(fake, start, end, perms);
+    for addr in start..end {
+        fake.mem.entry(addr).or_insert(0);
+    }
+}
+
+#[test]
+fn a_pointer_in_a_read_only_mapping_keeps_its_block() {
+    let mut fake = scene();
+    filled_mapping(&mut fake, READ_ONLY.0, READ_ONLY.1, "r--p");
+    put_word(&mut fake, READ_ONLY.0 + 0x10, X);
+
+    assert_eq!(reached(&mut fake, &[(X, 16)]), vec![X]);
+}
+
+#[test]
+fn a_pointer_in_an_executable_mapping_is_not_a_root() {
+    let mut fake = scene();
+    filled_mapping(&mut fake, CODE.0, CODE.1, "r-xp");
+    put_word(&mut fake, CODE.0 + 0x10, X);
+
+    assert!(reached(&mut fake, &[(X, 16)]).is_empty());
+}
+
+#[test]
+fn an_unreadable_read_only_mapping_is_an_error() {
+    let mut fake = scene();
+    map_line(&mut fake, READ_ONLY.0, READ_ONLY.1, "r--p");
+
+    let error = scan(&mut fake, &[]).expect_err("the range cannot be read");
+
+    assert!(
+        error.starts_with("a root range could not be read at 0x50000000"),
+        "{error}"
+    );
+}
+
+#[test]
+fn the_kernel_vvar_pages_are_not_scanned() {
+    let mut fake = scene();
+    fake.maps.push_str(&format!(
+        "{:x}-{:x} r--p 00000000 00:00 0 [vvar]\n",
+        VVAR.0, VVAR.1
+    ));
+
+    assert_eq!(scan(&mut fake, &[]), Ok(BTreeSet::new()));
 }
 
 #[test]
