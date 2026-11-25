@@ -19,7 +19,7 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 
 use crate::maps;
-use crate::monitor::Monitor;
+use crate::monitor::{COLLECT_EVERY, Monitor};
 use crate::trap;
 
 /// Set to any value to log each trapped call and a summary to stderr.
@@ -452,7 +452,7 @@ pub fn supervise_with<T: Tracer>(
         tracees: BTreeSet::new(),
         traps: BTreeMap::new(),
         root_code: None,
-        monitor: Monitor::default(),
+        monitor: Monitor::new(COLLECT_EVERY),
         early: BTreeSet::new(),
         announced: BTreeSet::new(),
         redelivered: BTreeMap::new(),

@@ -123,7 +123,9 @@ fn static_binary_records_every_hooked_allocator_entry() {
 }
 
 /// The 333-byte block is the only one nothing points to when the trapped
-/// `mmap` runs. `local` and `kept` still hold the other two. The fixture is
+/// `mmap` runs. `local` and `kept` still hold the other two. The loop before
+/// `mmap` brings the count to `COLLECT_EVERY`, so that trap runs the check
+/// (D53). The fixture is
 /// built at -O0 so that `local` stays in main's frame. glibc's startup blocks
 /// are referenced from RELRO data, which is read-only after startup. Read-only
 /// mappings are roots (D51), so those blocks must not be reported.

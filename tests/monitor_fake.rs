@@ -47,12 +47,17 @@ impl Hooked {
     }
 }
 
+/// A process checked at every trapped call, so most tests need no allocation count.
 fn hooked() -> Hooked {
+    hooked_every(0)
+}
+
+fn hooked_every(collect_every: u64) -> Hooked {
     let mut fake = Fake::new(static_image(), vec![trap(), seccomp(), trap()]);
     let pristine = fake.mem.clone();
     map_writable(&mut fake, STACK.0, STACK.1);
     map_line(&mut fake, DEFAULT_HINT, DEFAULT_HINT + REGION_LEN, "rwxp");
-    let mut monitor = Monitor::default();
+    let mut monitor = Monitor::new(collect_every);
     assert!(monitor.exec(&mut fake, pid()).is_empty());
     assert_eq!(fake.writes.len(), 19, "the install wrote every hook");
     let jumps = fake.writes[11..]
@@ -400,7 +405,7 @@ fn a_new_image_archives_the_old_one_and_a_dynamic_image_is_not_covered() {
 #[test]
 fn a_trap_from_an_unknown_process_is_ignored() {
     let mut fake = Fake::new(static_image(), vec![]);
-    let mut monitor = Monitor::default();
+    let mut monitor = Monitor::new(0);
 
     monitor.trapped(&mut fake, pid(), Some(libc::SYS_clone));
 
@@ -430,6 +435,152 @@ fn a_checked_report_lists_the_blocks_that_nothing_reaches() {
             }]
         }
     );
+}
+
+#[test]
+fn a_check_waits_until_collect_every_allocations_are_counted() {
+    let mut h = hooked_every(3);
+    map_writable(&mut h.fake, 0x7000, 0x9000);
+    set_head(&mut h.fake, 2);
+    write_slot(&mut h.fake, 0, malloc_record(16, 0x7000), true);
+    write_slot(&mut h.fake, 1, malloc_record(32, 0x8000), true);
+    put_word(&mut h.fake, RSP + 0x100, 0x7000);
+
+    h.monitor.trapped(&mut h.fake, pid(), None);
+
+    let report = only(h.monitor.finish());
+    assert_eq!(report.reachability, Reachability::Unchecked);
+}
+
+#[test]
+fn a_check_runs_at_the_trapped_call_that_reaches_collect_every() {
+    let mut h = hooked_every(2);
+    map_writable(&mut h.fake, 0x7000, 0x9000);
+    set_head(&mut h.fake, 2);
+    write_slot(&mut h.fake, 0, malloc_record(16, 0x7000), true);
+    write_slot(&mut h.fake, 1, malloc_record(32, 0x8000), true);
+    put_word(&mut h.fake, RSP + 0x100, 0x7000);
+
+    h.monitor.trapped(&mut h.fake, pid(), None);
+
+    let report = only(h.monitor.finish());
+    assert_eq!(
+        report.reachability,
+        Reachability::Checked {
+            lost: vec![Site {
+                caller: CALLER,
+                blocks: 1,
+                bytes: 32
+            }]
+        }
+    );
+}
+
+#[test]
+fn frees_do_not_count_toward_collect_every() {
+    let mut h = hooked_every(2);
+    map_writable(&mut h.fake, 0x7000, 0x9000);
+    set_head(&mut h.fake, 2);
+    write_slot(&mut h.fake, 0, malloc_record(16, 0x7000), true);
+    write_slot(
+        &mut h.fake,
+        1,
+        Record {
+            kind: Kind::Free,
+            size: 0,
+            caller: CALLER,
+            arg: 0x7000,
+            result: 0,
+        },
+        true,
+    );
+
+    h.monitor.trapped(&mut h.fake, pid(), None);
+
+    let report = only(h.monitor.finish());
+    assert_eq!(report.reachability, Reachability::Unchecked);
+}
+
+#[test]
+fn a_check_restarts_the_count() {
+    let mut h = hooked_every(2);
+    map_writable(&mut h.fake, 0x7000, 0x9000);
+    put_word(&mut h.fake, RSP + 0x100, 0x7000);
+    set_head(&mut h.fake, 2);
+    write_slot(&mut h.fake, 0, malloc_record(16, 0x7000), true);
+    write_slot(&mut h.fake, 1, malloc_record(32, 0x8000), true);
+    h.monitor.trapped(&mut h.fake, pid(), None);
+
+    // Nothing reaches the 16-byte block now, but one allocation is below the count.
+    put_word(&mut h.fake, RSP + 0x100, 0);
+    set_head(&mut h.fake, 3);
+    write_slot(&mut h.fake, 2, malloc_record(8, 0x8100), true);
+    h.monitor.trapped(&mut h.fake, pid(), None);
+
+    let report = only(h.monitor.finish());
+    assert_eq!(
+        report.reachability,
+        Reachability::Checked {
+            lost: vec![Site {
+                caller: CALLER,
+                blocks: 1,
+                bytes: 32
+            }]
+        }
+    );
+}
+
+#[test]
+fn a_check_that_meets_an_open_call_waits_for_the_next_trapped_call() {
+    let mut h = hooked_every(2);
+    map_writable(&mut h.fake, 0x7000, 0x9000);
+    put_word(&mut h.fake, RSP + 0x100, 0x7000);
+    put_word(&mut h.fake, RSP + 0x108, 0x8000);
+    set_head(&mut h.fake, 3);
+    write_slot(&mut h.fake, 0, malloc_record(16, 0x7000), true);
+    write_slot(&mut h.fake, 1, malloc_record(32, 0x8000), true);
+    write_slot(&mut h.fake, 2, malloc_record(8, 0), false);
+
+    h.monitor.trapped(&mut h.fake, pid(), None);
+    write_slot(&mut h.fake, 2, malloc_record(8, 0x8100), true);
+    h.monitor.trapped(&mut h.fake, pid(), None);
+
+    let report = only(h.monitor.finish());
+    assert_eq!(
+        report.reachability,
+        Reachability::Checked {
+            lost: vec![Site {
+                caller: CALLER,
+                blocks: 1,
+                bytes: 8
+            }]
+        }
+    );
+}
+
+#[test]
+fn a_fork_is_checked_whatever_the_count() {
+    let mut h = hooked_every(100);
+    map_writable(&mut h.fake, 0x7000, 0x9000);
+    set_head(&mut h.fake, 1);
+    write_slot(&mut h.fake, 0, malloc_record(16, 0x7000), true);
+
+    h.monitor.forked(&mut h.fake, pid(), Pid::from_raw(101));
+
+    let reports = h.monitor.finish();
+    assert_eq!(reports.len(), 2, "{reports:?}");
+    for report in reports {
+        assert_eq!(
+            report.reachability,
+            Reachability::Checked {
+                lost: vec![Site {
+                    caller: CALLER,
+                    blocks: 1,
+                    bytes: 16
+                }]
+            }
+        );
+    }
 }
 
 #[test]
@@ -466,7 +617,7 @@ fn an_unparsable_memory_map_is_reported_as_not_checked() {
 #[test]
 fn an_image_that_is_not_hooked_is_never_checked() {
     let mut fake = Fake::new(dynamic_image(), vec![]);
-    let mut monitor = Monitor::default();
+    let mut monitor = Monitor::new(0);
     assert!(monitor.exec(&mut fake, pid()).is_empty());
 
     monitor.trapped(&mut fake, pid(), None);
@@ -572,7 +723,7 @@ fn a_forked_child_inherits_a_check_of_the_memory_it_copies() {
 #[test]
 fn a_shared_clone_in_an_image_that_is_not_hooked_changes_nothing() {
     let mut fake = Fake::new(dynamic_image(), vec![]);
-    let mut monitor = Monitor::default();
+    let mut monitor = Monitor::new(0);
     assert!(monitor.exec(&mut fake, pid()).is_empty());
     fake.regs.rdi = CLONE_VM;
 

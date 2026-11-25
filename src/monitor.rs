@@ -2,10 +2,12 @@
 //!
 //! The record ring is read at each trapped system call and at each fork.
 //! Records written after a process's last trapped call are never read (D34).
-//! At each trapped call the process is also checked for reachability, which is
-//! reported and never acted on (P4b). Threads are not handled yet: the first
-//! clone that shares memory removes the hooks from that process, and its
-//! reachability checks end for good (P2b-3b).
+//! Once a process has made `COLLECT_EVERY` allocations since its last check,
+//! its next trapped call checks it for reachability. Each fork is checked
+//! whatever the count (D42, D47, D53). A check is reported and never acted on
+//! (P4b). Threads are not handled yet: the first clone that shares memory
+//! removes the hooks from that process, and its reachability checks end for
+//! good (P2b-3b).
 
 use std::collections::BTreeMap;
 use std::io;
@@ -18,11 +20,14 @@ use crate::install::{
 };
 use crate::ledger::{ImageReport, Ledger, Reachability};
 use crate::reach::reachable;
-use crate::ring::{RECORD_LEN, Slot, decode, plan_drain, slot_runs};
+use crate::ring::{Kind, RECORD_LEN, Slot, decode, plan_drain, slot_runs};
 use crate::supervisor::Tracer;
 
 /// `CLONE_VM`: the new task shares the caller's memory.
 const CLONE_VM: u64 = 0x0000_0100;
+
+/// Allocations between two reachability checks: the oracle's value (D42).
+pub const COLLECT_EVERY: u64 = 64;
 
 /// How far a drain got. Only `Settled` means the ledger matches the process now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +55,8 @@ struct Process {
     /// undecodable records. Every later check reports this reason.
     untrusted: Option<String>,
     reach: Reachability,
+    /// Allocations applied since the last completed check (D53).
+    allocations_since_check: u64,
 }
 
 impl Process {
@@ -62,6 +69,7 @@ impl Process {
             notes: Vec::new(),
             untrusted: None,
             reach: Reachability::Unchecked,
+            allocations_since_check: 0,
         }
     }
 
@@ -119,6 +127,9 @@ impl Process {
                     }
                     Some(Slot::Done(record)) => {
                         self.ledger.apply(record);
+                        if record.kind != Kind::Free {
+                            self.allocations_since_check += 1;
+                        }
                         index += 1;
                     }
                     None => {
@@ -150,6 +161,8 @@ impl Process {
         };
         match drained {
             Drained::Settled => {
+                // Reset even if the scan fails, so a failing scan is not retried at every trap.
+                self.allocations_since_check = 0;
                 let blocks: Vec<(u64, u64)> = self.ledger.live_blocks().collect();
                 let region = hook.base..hook.base + REGION_LEN;
                 self.reach = match reachable(tracer, pid, region, &blocks) {
@@ -190,14 +203,26 @@ impl Process {
 }
 
 /// The per-process state for a whole run.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Monitor {
     states: BTreeMap<Pid, Process>,
     reports: Vec<ImageReport>,
     images: u64,
+    collect_every: u64,
 }
 
 impl Monitor {
+    /// A monitor that checks a process once `collect_every` allocations have
+    /// been counted since its last check. Zero checks at every trapped call.
+    pub fn new(collect_every: u64) -> Self {
+        Monitor {
+            states: BTreeMap::new(),
+            reports: Vec::new(),
+            images: 0,
+            collect_every,
+        }
+    }
+
     /// A new image: the process just reached its exec-stop. Any state the pid
     /// had is archived first, because the exec replaces the image.
     pub fn exec<T: Tracer>(&mut self, tracer: &mut T, pid: Pid) -> Vec<Signal> {
@@ -224,7 +249,8 @@ impl Monitor {
 
     /// A process stopped at a trapped system call, which `syscall` names when
     /// it could be read. The ring is drained. A clone that shares memory removes
-    /// the hooks. Then the process is checked for reachability.
+    /// the hooks. Then the process is checked for reachability, if enough
+    /// allocations have been counted since its last check.
     pub fn trapped<T: Tracer>(&mut self, tracer: &mut T, pid: Pid, syscall: Option<i64>) {
         let Some(process) = self.states.get_mut(&pid) else {
             return;
@@ -236,7 +262,9 @@ impl Monitor {
         {
             process.unhook(tracer, pid);
         }
-        process.check(tracer, pid, drained);
+        if process.allocations_since_check >= self.collect_every {
+            process.check(tracer, pid, drained);
+        }
     }
 
     /// A process forked. Its ring is drained and checked first. The child copies
