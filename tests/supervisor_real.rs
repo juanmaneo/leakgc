@@ -143,9 +143,9 @@ fn static_binary_records_posix_memalign_by_the_block_it_returns() {
     assert!(!log.contains("R40"), "log:\n{log}");
 }
 
-/// `realloc(p, 0)` frees `p` from inside realloc's own code, and that inner
-/// `free` is not recorded (R40). The realloc record releases the block itself,
-/// so the report does not list it.
+/// `realloc(p, 0)` frees `p` from inside realloc's own code. That inner `free`
+/// is a nested hooked call, so the ledger is untrusted (R40, D56). The realloc
+/// record still releases the block itself, so the report does not list it.
 #[test]
 fn static_binary_releases_a_block_that_realloc_frees_from_inside() {
     let realloc_zero = build_c("realloc_zero_static.c", &["-static", "-no-pie"]);
@@ -156,7 +156,30 @@ fn static_binary_releases_a_block_that_realloc_frees_from_inside() {
     assert!(!log.contains("1 blocks, 100 bytes"), "log:\n{log}");
     assert!(!log.contains("not covered"), "log:\n{log}");
     assert!(!log.contains("unknown frees"), "log:\n{log}");
-    assert!(!log.contains("R40"), "log:\n{log}");
+    assert!(log.contains("(R40)"), "log:\n{log}");
+}
+
+/// Growing a block with `realloc` keeps the ledger trusted (R40, D56). Blocks
+/// that move and a block that crosses the mmap threshold (`mremap`) make no
+/// nested hooked call. `realloc(NULL, n)` tail-jumps into `malloc`, which is
+/// not nested either. Each phase frees its final block, so that size is not
+/// reported as outstanding.
+#[test]
+fn static_binary_growing_blocks_with_realloc_keeps_the_ledger_trusted() {
+    let grow = build_c("realloc_grow_static.c", &["-static", "-no-pie"]);
+    let path = grow.to_str().expect("UTF-8 path");
+    for (phase, freed) in [
+        ("small", " 65536 bytes"),
+        ("big", " 1048576 bytes"),
+        ("null", " 64 bytes"),
+    ] {
+        let (status, log) = run_leakgc(&[path, phase], &[("LEAKGC_LOG", "1")]);
+
+        assert_eq!(status.code(), Some(0), "phase {phase}\nlog:\n{log}");
+        assert!(!log.contains("R40"), "phase {phase}\nlog:\n{log}");
+        assert!(!log.contains("not covered"), "phase {phase}\nlog:\n{log}");
+        assert!(!log.contains(freed), "phase {phase}\nlog:\n{log}");
+    }
 }
 
 /// The 333-byte block is the only one nothing points to when the trapped

@@ -8,9 +8,10 @@
 //! half-written trampoline. If a jump write fails, the jumps already written
 //! are restored.
 //!
-//! The hooks share one depth counter. A hooked function that calls another
-//! hooked function (`realloc` calls `malloc` and `free`) records only the outer
-//! call. Nested calls run their displaced code and nothing more.
+//! The hooks share one depth counter. A hooked call that arrives while another
+//! is open is recorded as `Kind::Nested`, and the ledger is then untrusted, so
+//! nothing is freed on its strength (R40, D56). The one exception is a tail
+//! jump back to the exit stub, whose outer record already holds the result.
 
 use std::io;
 
@@ -241,7 +242,7 @@ pub fn install_hooks_at<T: Tracer>(
         let plan = hook::plan(addr, function, &refs, block, block + DISPLACED_OFFSET)?;
         let original = tracer.read_mem(pid, plan.patch_at, JMP_LEN)?;
         let original: [u8; JMP_LEN] = original.try_into().expect("read JMP_LEN bytes");
-        planned.push((hook, plan, original, (addr, addr + function.len() as u64)));
+        planned.push((hook, plan, original));
     }
 
     burn_exec_step(tracer, pid, pending_signals)?;
@@ -256,9 +257,9 @@ pub fn install_hooks_at<T: Tracer>(
         return Err(InstallError::MmapFailed(mapped));
     }
 
-    for (hook, plan, _, outer) in &planned {
+    for (hook, plan, _) in &planned {
         let block = hint + hook.block;
-        let mut code = pad_to(entry_code(hint, block, hook, *outer), DISPLACED_OFFSET);
+        let mut code = pad_to(entry_code(hint, block, hook), DISPLACED_OFFSET);
         code.extend_from_slice(&plan.displaced_code);
         let resume = plan.patch_at + plan.patch_len as u64;
         let tail_at = block + DISPLACED_OFFSET + plan.displaced_code.len() as u64;
@@ -268,7 +269,7 @@ pub fn install_hooks_at<T: Tracer>(
     tracer.write_mem(pid, hint + EXIT_OFFSET, &exit_code(hint))?;
 
     let mut patches = Vec::with_capacity(planned.len());
-    for (_, plan, original, _) in planned {
+    for (_, plan, original) in planned {
         if let Err(error) = tracer.write_mem(pid, plan.patch_at, &plan.jump) {
             restore(tracer, pid, &patches);
             return Err(error.into());
@@ -471,10 +472,9 @@ fn pad_to(code: Vec<u8>, len: u64) -> Vec<u8> {
 /// is already being recorded, it stores the call's arguments in a new record,
 /// parks the caller's return address and the address range of the function
 /// with the record, and returns through the exit stub. A nested call is
-/// recorded as `Kind::Nested` unless it is harmless (R40). Then it runs the
-/// displaced instructions. `outer` is the range `[start, end)` of the hooked
-/// function's own code.
-fn entry_code(base: u64, block: u64, hook: &Hook, outer: (u64, u64)) -> Vec<u8> {
+/// recorded as `Kind::Nested` (R40, D56). Then it runs the displaced
+/// instructions.
+fn entry_code(base: u64, block: u64, hook: &Hook) -> Vec<u8> {
     let head = base + HEAD_OFFSET;
     let depth = base + DEPTH_OFFSET;
     let records = base + RECORDS_OFFSET;
@@ -485,7 +485,6 @@ fn entry_code(base: u64, block: u64, hook: &Hook, outer: (u64, u64)) -> Vec<u8> 
 
     let mut a = CodeAssembler::new(64).expect(ASM_NEW);
     let mut nested = a.create_label();
-    let mut record_nested = a.create_label();
     let mut done = a.create_label();
     a.pushfq().expect(ASM);
     for reg in [rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11] {
@@ -518,38 +517,25 @@ fn entry_code(base: u64, block: u64, hook: &Hook, outer: (u64, u64)) -> Vec<u8> 
     }
     a.mov(qword_ptr(rcx + 32), hook.kind as i32).expect(ASM);
     a.mov(qword_ptr(rcx + 40), 0i32).expect(ASM);
-    // Pending: the caller's return address, the record it belongs to, and the
-    // address range of the function that made the call.
+    // Pending: the caller's return address and the record it belongs to.
     a.mov(r10, pending).expect(ASM);
     a.mov(qword_ptr(r10), rdx).expect(ASM);
     a.mov(qword_ptr(r10 + 8), rcx).expect(ASM);
-    a.mov(r9, outer.0).expect(ASM);
-    a.mov(qword_ptr(r10 + 16), r9).expect(ASM);
-    a.mov(r9, outer.1).expect(ASM);
-    a.mov(qword_ptr(r10 + 24), r9).expect(ASM);
     // Return through the exit stub, which stores the result.
     a.mov(rdx, exit).expect(ASM);
     a.mov(qword_ptr(rsp + 80), rdx).expect(ASM);
     a.jmp(done).expect(ASM);
-    // A nested call. A return address at the exit stub is a tail jump from
-    // another hooked function, and one inside the outer function is glibc calling
-    // a hooked entry from its own body. Both are harmless and are not recorded.
-    // Any other caller is recorded as `Kind::Nested`, so the monitor stops
-    // trusting the ledger (R40). Nothing here touches the depth counter or the
-    // pending slot, which belong to the outer call.
+    // A nested call. A return address at the exit stub is a tail jump from the
+    // outer hooked function, whose record already holds the result, so it is not
+    // recorded. Any other caller is recorded as `Kind::Nested`, including the
+    // outer function's own code (glibc's realloc calls malloc and free), so the
+    // monitor stops trusting the ledger (R40, D56). Nothing here touches the
+    // depth counter or the pending slot, which belong to the outer call.
     a.set_label(&mut nested).expect(ASM);
     a.mov(rdx, qword_ptr(rsp + 80)).expect(ASM);
     a.mov(r9, exit).expect(ASM);
     a.cmp(rdx, r9).expect(ASM);
     a.je(done).expect(ASM);
-    a.mov(r10, pending).expect(ASM);
-    a.mov(r9, qword_ptr(r10 + 16)).expect(ASM);
-    a.cmp(rdx, r9).expect(ASM);
-    a.jb(record_nested).expect(ASM);
-    a.mov(r9, qword_ptr(r10 + 24)).expect(ASM);
-    a.cmp(rdx, r9).expect(ASM);
-    a.jb(done).expect(ASM);
-    a.set_label(&mut record_nested).expect(ASM);
     a.mov(r11, head).expect(ASM);
     a.mov(eax, 1).expect(ASM);
     a.lock().xadd(qword_ptr(r11), rax).expect(ASM);
