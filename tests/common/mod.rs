@@ -99,6 +99,7 @@ pub struct Fake {
     pub fail_set_regs: bool,
     pub fail_reads: bool,
     pub fail_kill: bool,
+    pub fail_image: bool,
     pub calls: usize,
     pub writes: Vec<(u64, Vec<u8>)>,
     pub signals: Vec<Signal>,
@@ -139,6 +140,7 @@ impl Fake {
             fail_set_regs: false,
             fail_reads: false,
             fail_kill: false,
+            fail_image: false,
             calls: 0,
             writes: Vec::new(),
             signals: Vec::new(),
@@ -216,7 +218,7 @@ impl Tracer for Fake {
     }
 
     fn exe_image(&mut self, _pid: Pid) -> io::Result<Vec<u8>> {
-        if self.fails() {
+        if self.fail_image || self.fails() {
             return Err(io::Error::other("injected image failure"));
         }
         Ok(self.image.clone())

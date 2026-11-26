@@ -17,6 +17,7 @@ use std::io;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 
+use crate::crash::{self, Crash, Snapshot, Symbols};
 use crate::inject::{may_inject, xsave_available};
 use crate::install::{
     HEAD_OFFSET, Installed, RECORDS_OFFSET, REGION_LEN, install_hooks, uninstall,
@@ -87,6 +88,8 @@ struct Injection {
     deferred: Vec<Signal>,
     /// Injected frees started so far.
     freed: u64,
+    /// The block whose injected free is running, if any.
+    freeing: Option<u64>,
 }
 
 /// How far a drain got. Only `Settled` means the ledger matches the process now.
@@ -324,6 +327,7 @@ impl Process {
         tracer.set_regs(pid, frame.armed(block))?;
         self.quarantine.forget(block);
         self.injection.freed += 1;
+        self.injection.freeing = Some(block);
         Ok(())
     }
 
@@ -346,16 +350,19 @@ impl Process {
 
     /// A signal stopped the process while it may be running injected code.
     /// Returns the signals to deliver once the process is restored, or `None`
-    /// when the stop is not part of an injection.
+    /// when the stop is not part of an injection. A fault adds its crash report
+    /// to `alerts` (decision 3).
     fn injected_stop<T: Tracer>(
         &mut self,
         tracer: &mut T,
         pid: Pid,
         signal: Signal,
+        alerts: &mut Vec<String>,
     ) -> Option<Vec<Signal>> {
         let frame = self.injection.frame?;
         if signal != Signal::SIGTRAP {
             if is_fault(signal) {
+                alerts.extend(crash::report(&self.crash_at_fault(tracer, pid, signal)));
                 return Some(self.abandon(
                     tracer,
                     pid,
@@ -428,6 +435,30 @@ impl Process {
         Vec::new()
     }
 
+    /// What a fault in injected code left behind. It is read while the process
+    /// is stopped, before the process is killed.
+    fn crash_at_fault<T: Tracer>(&self, tracer: &mut T, pid: Pid, signal: Signal) -> Crash {
+        let hook = self.hook.as_ref().expect("an injection has hooks");
+        let state = match tracer.regs(pid) {
+            Ok(regs) => Ok(Snapshot {
+                regs,
+                stack: read_stack(tracer, pid, regs.rsp).map_err(|error| error.to_string()),
+            }),
+            Err(error) => Err(error.to_string()),
+        };
+        let symbols = tracer
+            .exe_image(pid)
+            .map_err(|error| error.to_string())
+            .and_then(|image| Symbols::parse(&image));
+        Crash {
+            signal,
+            freeing: self.injection.freeing,
+            state,
+            symbols,
+            own_code: hook.base..hook.base + REGION_LEN,
+        }
+    }
+
     /// Removes the hooks, after a clone that shares memory. The ledger is
     /// untrusted from here on, because only one thread is ever scanned. If the
     /// removal fails, the process stays patched, so its counts are not reported
@@ -459,6 +490,8 @@ pub struct Monitor {
     reports: Vec<ImageReport>,
     images: u64,
     collect_every: u64,
+    /// Crash report lines not yet taken by the supervisor (decision 3).
+    alerts: Vec<String>,
 }
 
 impl Monitor {
@@ -470,6 +503,7 @@ impl Monitor {
             reports: Vec::new(),
             images: 0,
             collect_every,
+            alerts: Vec::new(),
         }
     }
 
@@ -547,7 +581,8 @@ impl Monitor {
     }
 
     /// A process stopped on a signal. Returns the signals to deliver instead,
-    /// or `None` when the stop is not part of an injected free (P5).
+    /// or `None` when the stop is not part of an injected free (P5). A fault in
+    /// injected code adds its crash report, which [`Monitor::take_alerts`] returns.
     pub fn injected_stop<T: Tracer>(
         &mut self,
         tracer: &mut T,
@@ -556,7 +591,13 @@ impl Monitor {
     ) -> Option<Vec<Signal>> {
         self.states
             .get_mut(&pid)?
-            .injected_stop(tracer, pid, signal)
+            .injected_stop(tracer, pid, signal, &mut self.alerts)
+    }
+
+    /// The crash report lines written since the last call, in the order they
+    /// were written. The supervisor prints them to stderr at once (decision 3).
+    pub fn take_alerts(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.alerts)
     }
 
     /// A process forked. Its ring is drained and checked first. The child copies

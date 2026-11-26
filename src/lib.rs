@@ -17,10 +17,13 @@
 //!   [`monitor`] keeps one ledger per traced process.
 //! - [`quarantine`] holds the unreached blocks and poisons them, so that a
 //!   free is only ever made after a full scan cycle (P5).
+//! - [`crash`] writes the report for a fault during an injected free. It is
+//!   pure, as `gc` is.
 
 #[cfg(not(target_arch = "x86_64"))]
 compile_error!("leakgc's trap filter and register access are x86_64-only");
 
+pub mod crash;
 pub mod gc;
 pub mod hook;
 pub mod inject;

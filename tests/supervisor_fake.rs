@@ -578,6 +578,29 @@ fn a_block_moved_away_at_the_exit_of_an_mremap_is_not_freed() {
     );
 }
 
+/// A fault during an injected free kills the program, and the run returns its
+/// exit status. The crash report goes to stderr, which the tests do not capture.
+#[test]
+fn a_fault_in_an_injected_free_kills_the_program() {
+    let mut tracer = confirmed_block_at_call(
+        libc::SYS_mmap,
+        Box::new(|_: &mut common::Fake| {}),
+        vec![
+            stopped(STUB, Signal::SIGSEGV),
+            killed(STUB, Signal::SIGKILL),
+        ],
+    );
+
+    let (code, _) = run(&mut tracer, false);
+
+    assert_eq!(code, 128 + Signal::SIGKILL as i32);
+    assert!(
+        tracer.calls.contains(&Call::Kill(STUB, Signal::SIGKILL)),
+        "{:?}",
+        tracer.calls
+    );
+}
+
 #[test]
 fn a_refused_signal_requeue_is_reported_and_fails_the_run() {
     let mut tracer = Fake::new(

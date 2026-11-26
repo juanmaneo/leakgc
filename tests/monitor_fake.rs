@@ -1416,3 +1416,130 @@ fn refused_injections_are_counted_in_one_note_at_exit() {
         report.notes
     );
 }
+
+/// A fault inside the injected free of 0x8000 gives a report that names the
+/// block, the function the fault is in, and the stack word that names a function.
+#[test]
+fn a_fault_in_injected_code_gives_a_crash_report() {
+    let mut h = confirmed_held();
+    h.monitor.syscall_exited(&mut h.fake, pid());
+    let (start, _) = symbol("_int_malloc");
+    h.fake.regs.rip = start + 0x10;
+    let sp = h.fake.regs.rsp;
+    h.fake.poke(sp + 8, &(start + 0x20).to_le_bytes());
+
+    assert_eq!(signal_stop(&mut h, Signal::SIGSEGV), Some(vec![]));
+
+    let alerts = h.monitor.take_alerts();
+    assert_eq!(alerts[0], "crash report: SIGSEGV during an injected free");
+    assert_eq!(alerts[1], "  while freeing the block at 0x8000");
+    assert_eq!(
+        alerts[2],
+        format!("  crashed at 0x{:x}, in _int_malloc+0x10", start + 0x10)
+    );
+    assert!(
+        alerts.contains(&format!("    0x{:x}  _int_malloc+0x20", start + 0x20)),
+        "{alerts:?}"
+    );
+    assert!(h.monitor.take_alerts().is_empty(), "taken once");
+}
+
+#[test]
+fn a_fault_in_leakgc_code_is_named_as_such() {
+    let mut h = confirmed_held();
+    h.monitor.syscall_exited(&mut h.fake, pid());
+    let (start, _) = trampoline(&h.fake);
+
+    assert_eq!(signal_stop(&mut h, Signal::SIGSEGV), Some(vec![]));
+
+    let alerts = h.monitor.take_alerts();
+    assert_eq!(
+        alerts[2],
+        format!("  crashed at 0x{start:x}, in leakgc's own code")
+    );
+}
+
+#[test]
+fn a_fault_at_an_address_no_function_covers_says_so() {
+    let mut h = confirmed_held();
+    h.monitor.syscall_exited(&mut h.fake, pid());
+    h.fake.regs.rip = 1;
+
+    assert_eq!(signal_stop(&mut h, Signal::SIGSEGV), Some(vec![]));
+
+    let alerts = h.monitor.take_alerts();
+    assert_eq!(alerts[2], "  crashed at 0x1, in no known function");
+}
+
+#[test]
+fn unreadable_registers_leave_the_dump_out_and_the_process_is_still_killed() {
+    let mut h = confirmed_held();
+    h.monitor.syscall_exited(&mut h.fake, pid());
+    h.fake.fail_regs = true;
+
+    assert_eq!(signal_stop(&mut h, Signal::SIGSEGV), Some(vec![]));
+
+    assert_eq!(h.fake.signals, vec![Signal::SIGKILL]);
+    let alerts = h.monitor.take_alerts();
+    assert_eq!(alerts.len(), 5, "{alerts:?}");
+    assert!(
+        alerts[2].starts_with("  the registers could not be read: "),
+        "{alerts:?}"
+    );
+    assert!(!alerts.iter().any(|line| line == "  registers:"));
+}
+
+#[test]
+fn an_unreadable_stack_is_reported_after_the_registers() {
+    let mut h = confirmed_held();
+    h.monitor.syscall_exited(&mut h.fake, pid());
+    h.fake.fail_reads = true;
+
+    assert_eq!(signal_stop(&mut h, Signal::SIGSEGV), Some(vec![]));
+
+    let alerts = h.monitor.take_alerts();
+    assert!(
+        alerts.contains(&"    the stack could not be read: injected read failure".to_string()),
+        "{alerts:?}"
+    );
+}
+
+#[test]
+fn an_unreadable_image_leaves_the_function_names_out() {
+    let mut h = confirmed_held();
+    h.monitor.syscall_exited(&mut h.fake, pid());
+    let (start, _) = symbol("_int_malloc");
+    h.fake.regs.rip = start + 0x10;
+    h.fake.fail_image = true;
+
+    assert_eq!(signal_stop(&mut h, Signal::SIGSEGV), Some(vec![]));
+
+    let alerts = h.monitor.take_alerts();
+    assert_eq!(
+        alerts[2],
+        format!(
+            "  crashed at 0x{:x}, function names are unavailable: injected image failure",
+            start + 0x10
+        )
+    );
+}
+
+#[test]
+fn an_image_that_is_not_an_elf_leaves_the_function_names_out() {
+    let mut h = confirmed_held();
+    h.monitor.syscall_exited(&mut h.fake, pid());
+    let (start, _) = symbol("_int_malloc");
+    h.fake.regs.rip = start + 0x10;
+    h.fake.image = b"not an elf".to_vec();
+
+    assert_eq!(signal_stop(&mut h, Signal::SIGSEGV), Some(vec![]));
+
+    let alerts = h.monitor.take_alerts();
+    assert!(
+        alerts[2].starts_with(&format!(
+            "  crashed at 0x{:x}, function names are unavailable: ",
+            start + 0x10
+        )),
+        "{alerts:?}"
+    );
+}

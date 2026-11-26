@@ -374,6 +374,9 @@ impl<T: Tracer> Session<'_, '_, T> {
                     return;
                 }
                 if let Some(held) = self.monitor.injected_stop(&mut *self.tracer, pid, signal) {
+                    for line in self.monitor.take_alerts() {
+                        eprintln!("leakgc: {line}");
+                    }
                     self.requeue(pid, held);
                     let _ = self.tracer.cont(pid, None);
                     return;
