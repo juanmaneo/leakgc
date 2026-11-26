@@ -1,5 +1,6 @@
 //! Reading `/proc/<pid>/maps` for the diagnostic log (P2a) and for the roots
-//! and blocks of a reachability scan (P4b, D51).
+//! and blocks of a reachability scan (P4b, D51). It also finds a named shared
+//! library's mappings, which the dynamic install needs (P2b-4).
 
 use std::ops::Range;
 
@@ -58,6 +59,96 @@ pub fn scan_ranges(maps: &str) -> Option<ScanRanges> {
         }
     }
     Some(ranges)
+}
+
+/// The mappings of one named shared library, such as `libc.so.6`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Library {
+    /// The file path as the kernel names it.
+    pub path: String,
+    /// The inode of the file. A file at `path` with another inode is not the one mapped.
+    pub inode: u64,
+    /// Where the mapping of file offset 0 starts. Its page is the file's first page.
+    pub file_start: u64,
+    /// The `[start, end)` range that covers every mapping of the file.
+    pub span: (u64, u64),
+    /// Whether at least one mapping of the file is executable.
+    pub executable: bool,
+}
+
+/// The mappings of the library whose file name is exactly `name`. Returns
+/// `None` when no such mapping has file offset 0, or when a line does not
+/// parse. A deleted file is named `... (deleted)` and does not match.
+pub fn library(maps: &str, name: &str) -> Option<Library> {
+    let lines = maps
+        .lines()
+        .map(parse_line)
+        .collect::<Option<Vec<MapLine<'_>>>>()?;
+    let first = lines
+        .iter()
+        .find(|line| line.offset == 0 && file_name(line.path) == name)?;
+    let of_file: Vec<&MapLine<'_>> = lines
+        .iter()
+        .filter(|line| line.inode == first.inode && line.path == first.path)
+        .collect();
+    let span = of_file.iter().fold((u64::MAX, 0), |(low, high), line| {
+        (low.min(line.start), high.max(line.end))
+    });
+    Some(Library {
+        path: first.path.to_string(),
+        inode: first.inode,
+        file_start: first.start,
+        span,
+        executable: of_file
+            .iter()
+            .any(|line| line.perms.as_bytes().get(2) == Some(&b'x')),
+    })
+}
+
+/// The last component of a path. A path without a slash is its own file name.
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// One parsed `/proc/<pid>/maps` line. The path is the rest of the line, so
+/// it may contain spaces.
+struct MapLine<'a> {
+    start: u64,
+    end: u64,
+    perms: &'a str,
+    offset: u64,
+    inode: u64,
+    path: &'a str,
+}
+
+fn parse_line(line: &str) -> Option<MapLine<'_>> {
+    let mut rest = line;
+    let mut field = || {
+        let trimmed = rest.trim_start();
+        let end = trimmed.find(' ').unwrap_or(trimmed.len());
+        let (field, tail) = trimmed.split_at(end);
+        rest = tail;
+        (!field.is_empty()).then_some(field)
+    };
+    let (start, end) = field()?.split_once('-')?;
+    let start = u64::from_str_radix(start, 16).ok()?;
+    let end = u64::from_str_radix(end, 16).ok()?;
+    if start > end {
+        return None;
+    }
+    let perms = field()?;
+    let offset = u64::from_str_radix(field()?, 16).ok()?;
+    // The device is read and not used.
+    field()?;
+    let inode = field()?.parse().ok()?;
+    Some(MapLine {
+        start,
+        end,
+        perms,
+        offset,
+        inode,
+        path: rest.trim_start(),
+    })
 }
 
 /// The lowest `at` in `window` such that `[at, at + len)` lies inside no mapping,

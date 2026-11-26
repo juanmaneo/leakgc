@@ -10,6 +10,7 @@
 //! at a time (P5). Each block is checked again just before its free (R42).
 //! Threads are not handled yet: the first clone that shares memory removes the
 //! hooks from that process, and its reachability checks end for good (P2b-3b).
+//! A dynamically linked process is hooked once its C library is mapped (P2b-4).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
@@ -20,11 +21,12 @@ use nix::unistd::Pid;
 use crate::crash::{self, Crash, Snapshot, Symbols};
 use crate::inject::{may_inject, xsave_available};
 use crate::install::{
-    HEAD_OFFSET, Installed, RECORDS_OFFSET, REGION_LEN, install_hooks, uninstall,
+    HEAD_OFFSET, InstallError, Installed, RECORDS_OFFSET, REGION_LEN, install_hooks,
+    install_library_hooks, uninstall,
 };
 use crate::ledger::{ImageReport, Ledger, Reachability, released};
 use crate::quarantine::Quarantine;
-use crate::reach::reachable;
+use crate::reach::{Scan, reachable};
 use crate::ring::{Kind, RECORD_LEN, Slot, decode, plan_drain, slot_runs};
 use crate::supervisor::Tracer;
 
@@ -49,6 +51,9 @@ const CLEARANCE: u64 = 256;
 const STACK_WORDS: usize = 128;
 /// The direction flag, which the ABI requires to be clear on entry to a function.
 const DIRECTION_FLAG: u64 = 0x400;
+/// The note for a hooked image whose allocator internals are not named, so no
+/// block is freed by injection.
+const NO_INTERNALS: &str = "the allocator's internal functions have no symbol table entries, so no block is freed by injection";
 
 /// Where an injected `free` starts from. `saved` is the state the process
 /// stopped in, and the last injected call restores it. The calls run below
@@ -130,6 +135,9 @@ struct Process {
     /// Blocks whose injected free did not start, because the process was not at
     /// a point where one is known to be safe (R37). Counted, and noted at exit.
     skipped_frees: u64,
+    /// Set while a dynamically linked process waits for its C library to be
+    /// mapped, so that its hooks can be installed (P2b-4).
+    awaiting_library: bool,
 }
 
 impl Process {
@@ -147,10 +155,17 @@ impl Process {
             injection: Injection::default(),
             inject_at_exit: Vec::new(),
             skipped_frees: 0,
+            awaiting_library: false,
         }
     }
 
     fn archive(mut self, reason: String) -> ImageReport {
+        if self.awaiting_library {
+            self.notes.push(
+                "the C library was never mapped, so no hooks were installed: not covered"
+                    .to_string(),
+            );
+        }
         if self.skipped_frees > 0 {
             self.notes.push(format!(
                 "{} blocks were not freed by injection: the program was not at a point where an injected free is known to be safe (R37), so they stay held",
@@ -263,7 +278,7 @@ impl Process {
                 let blocks: Vec<(u64, u64)> = self.ledger.live_blocks().collect();
                 let region = hook.base..hook.base + REGION_LEN;
                 let (reach, checked) = match reachable(tracer, pid, region, &blocks) {
-                    Ok(scan) => match self.quarantine.update(tracer, pid, &blocks, &scan) {
+                    Ok(scan) => match self.hold_unreached(tracer, pid, &hook, &blocks, &scan) {
                         Ok(()) => (
                             Reachability::Checked {
                                 lost: self.ledger.unreached_sites(&scan.reached),
@@ -287,6 +302,65 @@ impl Process {
                 false
             }
         }
+    }
+
+    /// Records a fresh installation of hooks and the notes that go with it.
+    fn hooked(&mut self, hook: Installed, after_library: bool) {
+        self.notes.push("hooked malloc, free, realloc, calloc, memalign, aligned_alloc, valloc, pvalloc, posix_memalign and malloc_trim; allocations after the last trapped call are not read (D34)".to_string());
+        if after_library {
+            self.notes.push("hooks were installed after the C library was mapped: allocations before that are not recorded".to_string());
+        }
+        if hook.internal.is_none() {
+            self.notes.push(NO_INTERNALS.to_string());
+        }
+        self.hook = Some(hook);
+    }
+
+    /// Installs the hooks in the C library, if it is mapped at this exit. A
+    /// failure ends the wait, so the process is then not covered.
+    fn try_library<T: Tracer>(
+        &mut self,
+        tracer: &mut T,
+        pid: Pid,
+        pending_signals: &mut Vec<Signal>,
+    ) {
+        match install_library_hooks(tracer, pid, pending_signals) {
+            Ok(None) => {}
+            Ok(Some(hook)) => {
+                self.awaiting_library = false;
+                self.hooked(hook, true);
+            }
+            Err(error) => {
+                self.awaiting_library = false;
+                self.notes.push(format!("not covered: {error:?}"));
+            }
+        }
+    }
+
+    /// Stops waiting for the C library, because a thread was started before it
+    /// was mapped. The hooks are then never installed.
+    fn give_up_waiting(&mut self) {
+        if self.awaiting_library {
+            self.awaiting_library = false;
+            self.notes.push("threads started before the C library was mapped: hooks are not installed, so this program is not covered".to_string());
+        }
+    }
+
+    /// Holds the blocks that a scan found unreached (P5). Nothing is poisoned
+    /// unless an injected free can follow, since a block that is never freed
+    /// would only put the program at risk.
+    fn hold_unreached<T: Tracer>(
+        &mut self,
+        tracer: &mut T,
+        pid: Pid,
+        hook: &Installed,
+        blocks: &[(u64, u64)],
+        scan: &Scan,
+    ) -> Result<(), String> {
+        if !injection_possible(hook) {
+            return Ok(());
+        }
+        self.quarantine.update(tracer, pid, blocks, scan)
     }
 
     /// Starts an injected `free` of `blocks` at the exit of the trapped call,
@@ -518,12 +592,12 @@ impl Monitor {
         let mut process = Process::new(format!("image {} (pid {})", self.images, pid.as_raw()));
         let mut pending_signals = Vec::new();
         match install_hooks(tracer, pid, &mut pending_signals) {
-            Ok(hook) => {
-                process.hook = Some(hook);
-                process.notes.push(
-                    "hooked malloc, free, realloc, calloc, memalign, aligned_alloc, valloc, pvalloc, posix_memalign and malloc_trim; allocations after the last trapped call are not read (D34)"
-                        .to_string(),
-                );
+            Ok(hook) => process.hooked(hook, false),
+            Err(InstallError::Dynamic) => {
+                process.awaiting_library = true;
+                process
+                    .notes
+                    .push("hooks wait until the C library is mapped".to_string());
             }
             Err(error) => process.notes.push(format!("not covered: {error:?}")),
         }
@@ -550,10 +624,15 @@ impl Monitor {
             && shares_memory(tracer, pid, nr)
         {
             process.unhook(tracer, pid);
+            process.give_up_waiting();
         }
         process.inject_at_exit.clear();
         if process.injection.frame.is_some() {
             return false;
+        }
+        // The C library's code is mapped by an mmap, so that call's exit is where its hooks go in.
+        if process.awaiting_library && syscall == Some(libc::SYS_mmap) {
+            return true;
         }
         let checked = process.allocations_since_check >= self.collect_every
             && process.check(tracer, pid, drained);
@@ -569,15 +648,23 @@ impl Monitor {
     }
 
     /// A trapped call returned, at the exit that [`Monitor::trapped`] asked for.
-    /// If confirmed blocks are waiting, the first injected free starts here.
-    pub fn syscall_exited<T: Tracer>(&mut self, tracer: &mut T, pid: Pid) {
+    /// A dynamically linked process whose C library is now mapped gets its hooks
+    /// here. If confirmed blocks are waiting, the first injected free starts here.
+    /// Returns the signals that stopped the process while the hooks were
+    /// installed, which the caller re-queues.
+    pub fn syscall_exited<T: Tracer>(&mut self, tracer: &mut T, pid: Pid) -> Vec<Signal> {
         let Some(process) = self.states.get_mut(&pid) else {
-            return;
+            return Vec::new();
         };
+        let mut pending_signals = Vec::new();
+        if process.awaiting_library {
+            process.try_library(tracer, pid, &mut pending_signals);
+        }
         let blocks = std::mem::take(&mut process.inject_at_exit);
         if !blocks.is_empty() {
             process.start_injection(tracer, pid, blocks);
         }
+        pending_signals
     }
 
     /// A process stopped on a signal. Returns the signals to deliver instead,
@@ -647,6 +734,12 @@ fn shares_memory<T: Tracer>(tracer: &mut T, pid: Pid, nr: i64) -> bool {
         Ok(regs.rdi)
     };
     flags.map_or(true, |flags| flags & CLONE_VM != 0)
+}
+
+/// Whether an injected free can ever start in this image. When it cannot, the
+/// unreached blocks are not held, so the program's memory is not changed (P5).
+fn injection_possible(hook: &Installed) -> bool {
+    xsave_available() && hook.internal.is_some()
 }
 
 /// Whether a signal means that the injected code itself faulted.

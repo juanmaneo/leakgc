@@ -1,4 +1,4 @@
-use leakgc::maps::{ScanRanges, find_gap, scan_ranges, writable_count};
+use leakgc::maps::{ScanRanges, find_gap, library, scan_ranges, writable_count};
 
 #[test]
 fn counts_only_mappings_with_write_permission() {
@@ -183,4 +183,83 @@ fn find_gap_places_the_hook_region_in_the_wine_ntdll_gap() {
         find_gap(maps, window, len, 0x1_0000),
         Some(0x6fff_83bb_0000)
     );
+}
+
+#[test]
+fn library_spans_every_mapping_of_the_named_file() {
+    let sample = "\
+7f0000000000-7f0000028000 r--p 00000000 08:01 42 /usr/lib/libc.so.6
+7f0000028000-7f0000180000 r-xp 00028000 08:01 42 /usr/lib/libc.so.6
+7f0000180000-7f00001d0000 r--p 00180000 08:01 42 /usr/lib/libc.so.6
+7f00001d0000-7f00001d4000 rw-p 001d0000 08:01 42 /usr/lib/libc.so.6
+7f00001d4000-7f00001d8000 rw-p 00000000 00:00 0
+";
+    let library = library(sample, "libc.so.6").expect("libc is mapped");
+
+    assert_eq!(library.path, "/usr/lib/libc.so.6");
+    assert_eq!(library.inode, 42);
+    assert_eq!(library.file_start, 0x7f00_0000_0000);
+    assert_eq!(library.span, (0x7f00_0000_0000, 0x7f00_001d_4000));
+    assert!(library.executable);
+}
+
+#[test]
+fn library_is_not_executable_until_its_text_is_mapped() {
+    let sample = "7f0000000000-7f0000028000 r--p 00000000 08:01 42 /usr/lib/libc.so.6\n";
+
+    let library = library(sample, "libc.so.6").expect("libc is mapped");
+
+    assert!(!library.executable);
+}
+
+#[test]
+fn library_keeps_spaces_in_the_path_and_matches_the_file_name_only() {
+    let sample = "\
+7f0000000000-7f0000001000 r--p 00000000 08:01 7 /opt/my games/libc.so.6
+7f0000001000-7f0000002000 r--p 00000000 08:01 8 /usr/lib/libc.so.6 (deleted)
+";
+
+    let found = library(sample, "libc.so.6").expect("the spaced path is a library");
+
+    assert_eq!(found.path, "/opt/my games/libc.so.6");
+    assert_eq!(found.inode, 7);
+    assert!(library(sample.lines().nth(1).unwrap(), "libc.so.6").is_none());
+}
+
+#[test]
+fn library_needs_a_mapping_at_file_offset_zero() {
+    let sample = "7f0000028000-7f0000180000 r-xp 00028000 08:01 42 /usr/lib/libc.so.6\n";
+
+    assert!(library(sample, "libc.so.6").is_none());
+}
+
+#[test]
+fn library_is_none_when_any_line_does_not_parse() {
+    let sample = "\
+7f0000000000-7f0000028000 r--p 00000000 08:01 42 /usr/lib/libc.so.6
+not a mapping line
+";
+
+    assert!(library(sample, "libc.so.6").is_none());
+}
+
+#[test]
+fn library_is_none_for_each_malformed_line_after_a_valid_one() {
+    let valid = "7f0000000000-7f0000028000 r--p 00000000 08:01 42 /usr/lib/libc.so.6";
+    for bad in [
+        "7f0000000000-7f0000028000 r--p 00000000 08:01",
+        "7f0000000000 r--p 00000000 08:01 42 /x",
+        "7f0000000000-zz r--p 00000000 08:01 42 /x",
+        "7f0000000000-7f0000028000 r--p",
+        "7f0000000000-7f0000028000 r--p 00000000",
+        "zz-7f0000028000 r--p 00000000 08:01 42 /x",
+        "7f0000028000-7f0000000000 r--p 00000000 08:01 42 /x",
+        "7f0000000000-7f0000028000",
+        "7f0000000000-7f0000028000 r--p zz 08:01 42 /x",
+        "7f0000000000-7f0000028000 r--p 00000000 08:01 nope /x",
+        "",
+    ] {
+        let sample = format!("{valid}\n{bad}\n");
+        assert!(library(&sample, "libc.so.6").is_none(), "{bad:?}");
+    }
 }

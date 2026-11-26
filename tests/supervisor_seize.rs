@@ -67,6 +67,10 @@ impl Tracer for RefuseSeize {
         self.os.exe_image(pid)
     }
 
+    fn file_image(&mut self, path: &str) -> io::Result<(u64, Vec<u8>)> {
+        self.os.file_image(path)
+    }
+
     fn regs(&mut self, pid: Pid) -> nix::Result<libc::user_regs_struct> {
         self.os.regs(pid)
     }

@@ -460,7 +460,7 @@ fn an_exit_is_archived_with_its_reason_and_an_unknown_pid_is_ignored() {
 }
 
 #[test]
-fn a_new_image_archives_the_old_one_and_a_dynamic_image_is_not_covered() {
+fn a_new_image_archives_the_old_one_and_a_dynamic_image_waits_for_its_library() {
     let mut h = hooked();
     let mut dynamic = Fake::new(dynamic_image(), vec![]);
 
@@ -478,10 +478,11 @@ fn a_new_image_archives_the_old_one_and_a_dynamic_image_is_not_covered() {
         reports[1]
             .notes
             .iter()
-            .any(|note| note == "not covered: NotStaticExecutable"),
+            .any(|note| note == "hooks wait until the C library is mapped"),
         "{:?}",
         reports[1].notes
     );
+    assert!(has_note(&reports[1], "the C library was never mapped"));
 }
 
 #[test]
@@ -802,30 +803,207 @@ fn a_forked_child_inherits_a_check_of_the_memory_it_copies() {
     );
 }
 
+/// A dynamically linked process whose C library is mapped, and whose hooks are
+/// installed at the first trapped `mmap` exit after the mapping. The hook region
+/// lands at `DEFAULT_HINT`, so the record helpers apply.
+fn dynamic_hooked(image: &[u8]) -> Hooked {
+    let mut fake = dynamic_fake(vec![trap(), seccomp(), trap()]);
+    map_writable(&mut fake, STACK.0, STACK.1);
+    let mut monitor = Monitor::new(0);
+    assert!(monitor.exec(&mut fake, pid()).is_empty());
+    map_library(
+        &mut fake,
+        image,
+        library_base_at_hint(image),
+        LIBRARY_INODE,
+        LIBRARY_PATH,
+        "r-xp",
+    );
+    assert!(monitor.trapped(&mut fake, pid(), Some(libc::SYS_mmap)));
+    let pristine = fake.mem.clone();
+    assert!(monitor.syscall_exited(&mut fake, pid()).is_empty());
+    assert_eq!(fake.writes.len(), 24, "the install wrote every hook");
+    let jumps = fake.writes[14..]
+        .iter()
+        .map(|(at, bytes)| (*at, bytes.clone()))
+        .collect();
+    map_line(&mut fake, DEFAULT_HINT, DEFAULT_HINT + REGION_LEN, "rwxp");
+    Hooked {
+        monitor,
+        fake,
+        jumps,
+        pristine,
+    }
+}
+
 #[test]
-fn a_shared_clone_in_an_image_that_is_not_hooked_changes_nothing() {
-    let mut fake = Fake::new(dynamic_image(), vec![]);
+fn a_dynamic_process_is_hooked_at_the_first_mmap_exit_after_its_library_is_mapped() {
+    let mut fake = dynamic_fake(vec![trap(), seccomp(), trap()]);
+    map_writable(&mut fake, STACK.0, STACK.1);
+    let mut monitor = Monitor::new(0);
+    assert!(monitor.exec(&mut fake, pid()).is_empty());
+
+    assert!(monitor.trapped(&mut fake, pid(), Some(libc::SYS_mmap)));
+    assert!(monitor.syscall_exited(&mut fake, pid()).is_empty());
+    assert!(fake.writes.is_empty(), "the library is not mapped yet");
+
+    map_library(
+        &mut fake,
+        library_image(),
+        library_base_at_hint(library_image()),
+        LIBRARY_INODE,
+        LIBRARY_PATH,
+        "r-xp",
+    );
+    assert!(monitor.trapped(&mut fake, pid(), Some(libc::SYS_mmap)));
+    assert!(monitor.syscall_exited(&mut fake, pid()).is_empty());
+
+    assert_eq!(fake.writes.len(), 24, "the install wrote every hook");
+    let report = only(monitor.finish());
+    assert!(has_note(
+        &report,
+        "hooks were installed after the C library was mapped"
+    ));
+    assert!(
+        !report
+            .notes
+            .iter()
+            .any(|note| note.starts_with("not covered"))
+    );
+}
+
+#[test]
+fn a_library_that_is_never_mapped_is_reported_as_not_covered() {
+    let mut fake = dynamic_fake(vec![]);
+    let mut monitor = Monitor::new(0);
+    assert!(monitor.exec(&mut fake, pid()).is_empty());
+
+    monitor.exited(pid(), "exit code 0".to_string());
+
+    let report = only(monitor.finish());
+    assert!(has_note(
+        &report,
+        "the C library was never mapped, so no hooks were installed: not covered"
+    ));
+    assert_eq!(report.notes.last().map(String::as_str), Some("exit code 0"));
+}
+
+#[test]
+fn an_image_that_does_not_parse_is_reported_as_not_covered() {
+    let mut fake = Fake::new(b"not an elf", vec![]);
+    let mut monitor = Monitor::new(0);
+    assert!(monitor.exec(&mut fake, pid()).is_empty());
+
+    monitor.exited(pid(), "exit code 0".to_string());
+
+    let report = only(monitor.finish());
+    assert!(has_note(&report, "not covered: Parse("));
+    assert!(fake.writes.is_empty());
+}
+
+#[test]
+fn a_library_whose_file_was_replaced_is_reported_as_not_covered() {
+    let mut fake = dynamic_fake(vec![]);
+    let mut monitor = Monitor::new(0);
+    assert!(monitor.exec(&mut fake, pid()).is_empty());
+    map_library(
+        &mut fake,
+        library_image(),
+        library_base_at_hint(library_image()),
+        LIBRARY_INODE,
+        LIBRARY_PATH,
+        "r-xp",
+    );
+    fake.files.insert(
+        LIBRARY_PATH.to_string(),
+        (LIBRARY_INODE + 1, library_image().to_vec()),
+    );
+
+    assert!(monitor.trapped(&mut fake, pid(), Some(libc::SYS_mmap)));
+    assert!(monitor.syscall_exited(&mut fake, pid()).is_empty());
+
+    assert!(fake.writes.is_empty());
+    let report = only(monitor.finish());
+    assert!(has_note(
+        &report,
+        "not covered: LibraryChanged(\"the file on disk is not the file that is mapped\")"
+    ));
+}
+
+#[test]
+fn a_thread_started_before_the_library_is_mapped_cancels_the_wait() {
+    let mut fake = dynamic_fake(vec![]);
     let mut monitor = Monitor::new(0);
     assert!(monitor.exec(&mut fake, pid()).is_empty());
     fake.regs.rdi = CLONE_VM;
 
     monitor.trapped(&mut fake, pid(), Some(libc::SYS_clone));
+    assert!(
+        !monitor.trapped(&mut fake, pid(), Some(libc::SYS_mmap)),
+        "no mmap exit is awaited any more"
+    );
 
     let report = only(monitor.finish());
     assert_eq!(report.reachability, Reachability::Unchecked);
-    assert_eq!(report.notes.len(), 2, "{:?}", report.notes);
+    assert!(has_note(
+        &report,
+        "threads started before the C library was mapped"
+    ));
+    assert!(!has_note(&report, "the C library was never mapped"));
+    assert_eq!(report.notes.len(), 3, "{:?}", report.notes);
+}
+
+#[test]
+fn a_hooked_library_poisons_a_block_it_holds() {
+    let mut h = dynamic_hooked(library_image());
+    hold_a_block(&mut h);
+
+    h.monitor.trapped(&mut h.fake, pid(), None);
+
+    assert_eq!(h.fake.bytes(0x8000, 32), vec![POISON; 32]);
+}
+
+#[test]
+fn a_stripped_library_holds_a_block_without_poisoning_it() {
+    let mut h = dynamic_hooked(stripped_library_image());
+    hold_a_block(&mut h);
+
+    h.monitor.trapped(&mut h.fake, pid(), None);
+
+    assert_eq!(h.fake.bytes(0x8000, 32), vec![0; 32], "nothing is poisoned");
+    let report = only(h.monitor.finish());
+    assert!(has_note(
+        &report,
+        "the allocator's internal functions have no symbol table entries"
+    ));
+    assert_eq!(
+        report.reachability,
+        Reachability::Checked {
+            lost: vec![Site {
+                caller: CALLER,
+                blocks: 1,
+                bytes: 32
+            }]
+        }
+    );
 }
 
 /// A process with a live block at 0x7000 and an unreached block at 0x8000,
 /// which the first check holds in quarantine.
 fn with_a_held_block() -> Hooked {
     let mut h = hooked();
+    hold_a_block(&mut h);
+    h
+}
+
+/// Adds the live block at 0x7000 and the unreached block at 0x8000 that
+/// [`with_a_held_block`] describes, to a process whose hooks are installed.
+fn hold_a_block(h: &mut Hooked) {
     map_writable(&mut h.fake, 0x7000, 0x9000);
     set_head(&mut h.fake, 2);
     write_slot(&mut h.fake, 0, malloc_record(16, 0x7000), true);
     write_slot(&mut h.fake, 1, malloc_record(32, 0x8000), true);
     put_word(&mut h.fake, RSP + 0x100, 0x7000);
-    h
 }
 
 #[test]

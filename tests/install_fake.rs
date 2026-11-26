@@ -5,12 +5,13 @@
 mod common;
 
 use goblin::elf::Elf;
+use goblin::elf::program_header::PT_LOAD;
 use goblin::elf::section_header::SHF_EXECINSTR;
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic};
 use leakgc::hook::{Refusal, jmp_rel32};
 use leakgc::install::{
     DEFAULT_HINT, InstallError, Installed, install_hooks as install_hooks_with_signals,
-    install_hooks_at as install_hooks_at_with_signals, uninstall,
+    install_hooks_at as install_hooks_at_with_signals, install_library_hooks, uninstall,
 };
 use nix::sys::signal::Signal;
 use nix::sys::wait::WaitStatus;
@@ -27,6 +28,46 @@ fn install_hooks_at(
     hint: u64,
 ) -> Result<Installed, InstallError> {
     install_hooks_at_with_signals(fake, pid, hint, &mut Vec::new())
+}
+
+fn install_library(fake: &mut Fake) -> Result<Option<Installed>, InstallError> {
+    install_library_hooks(fake, pid(), &mut Vec::new())
+}
+
+/// A shared-object header with one loadable segment and no sections or
+/// symbols, so it parses, and the segment's file offset and address are as given.
+fn header_with_segment(p_offset: u64, p_vaddr: u64) -> Vec<u8> {
+    let mut image = header_only(3);
+    image[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    image[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+    let mut segment = vec![0u8; 56];
+    segment[0..4].copy_from_slice(&PT_LOAD.to_le_bytes());
+    segment[4..8].copy_from_slice(&5u32.to_le_bytes()); // read and execute
+    segment[8..16].copy_from_slice(&p_offset.to_le_bytes());
+    segment[16..24].copy_from_slice(&p_vaddr.to_le_bytes());
+    segment[48..56].copy_from_slice(&PAGE.to_le_bytes()); // p_align
+    image.extend_from_slice(&segment);
+    image
+}
+
+/// A copy of `image` with the first occurrence of the symbol name `from`
+/// replaced by `to`, which must be the same length.
+fn with_renamed_symbol(image: &[u8], from: &str, to: &str) -> Vec<u8> {
+    assert_eq!(from.len(), to.len());
+    let needle = format!("\0{from}\0");
+    let at = image
+        .windows(needle.len())
+        .position(|window| window == needle.as_bytes())
+        .expect("name present")
+        + 1;
+    let mut out = image.to_vec();
+    out[at..at + to.len()].copy_from_slice(to.as_bytes());
+    out
+}
+
+/// The address and size of `.text` in a library mapped at `base`.
+fn library_text(base: u64) -> u64 {
+    base + text_section(library_image()).0
 }
 
 /// A 64-byte ELF header with no sections or segments.
@@ -652,15 +693,305 @@ fn a_position_independent_image_is_not_static() {
 }
 
 #[test]
-fn a_dynamic_image_is_not_static() {
+fn a_dynamic_image_is_refused_by_the_static_install() {
     let mut fake = Fake::new(dynamic_image(), vec![]);
 
     let result = install_hooks(&mut fake, pid());
 
     assert!(
-        matches!(result, Err(InstallError::NotStaticExecutable)),
+        matches!(result, Err(InstallError::Dynamic)),
         "got {result:?}"
     );
+}
+
+#[test]
+fn a_mapped_library_is_hooked_within_reach_of_its_code() {
+    let mut fake = dynamic_fake(vec![trap(), seccomp(), trap()]);
+    map_library(
+        &mut fake,
+        library_image(),
+        LIBRARY_BASE,
+        LIBRARY_INODE,
+        LIBRARY_PATH,
+        "r-xp",
+    );
+
+    let installed = install_library(&mut fake)
+        .expect("installs")
+        .expect("the library is mapped");
+
+    assert_eq!(installed.patches.len(), 10);
+    assert!(installed.base.abs_diff(LIBRARY_BASE) < 0x7000_0000);
+    for patch in &installed.patches {
+        assert_eq!(fake.at(patch.at), 0xe9, "jump at {:#x}", patch.at);
+    }
+    let int_malloc = LIBRARY_BASE + function_symbol(library_image(), "_int_malloc");
+    assert!(
+        installed
+            .internal
+            .is_some_and(|ranges| ranges.iter().any(|&(start, _)| start == int_malloc))
+    );
+    assert_eq!(fake.writes.len(), 24);
+}
+
+#[test]
+fn a_stripped_library_is_hooked_without_internal_ranges() {
+    let mut fake = dynamic_fake(vec![trap(), seccomp(), trap()]);
+    map_library(
+        &mut fake,
+        stripped_library_image(),
+        LIBRARY_BASE,
+        LIBRARY_INODE,
+        LIBRARY_PATH,
+        "r-xp",
+    );
+
+    let installed = install_library(&mut fake)
+        .expect("installs")
+        .expect("the library is mapped");
+
+    assert_eq!(installed.patches.len(), 10);
+    assert!(installed.internal.is_none());
+}
+
+#[test]
+fn a_library_without_an_executable_mapping_is_not_hooked_yet() {
+    let mut fake = dynamic_fake(vec![]);
+    map_library(
+        &mut fake,
+        library_image(),
+        LIBRARY_BASE,
+        LIBRARY_INODE,
+        LIBRARY_PATH,
+        "r--p",
+    );
+
+    let result = install_library(&mut fake).expect("no error");
+
+    assert!(result.is_none());
+    assert!(fake.writes.is_empty());
+}
+
+#[test]
+fn a_library_that_is_not_mapped_is_not_hooked_yet() {
+    let mut fake = dynamic_fake(vec![]);
+
+    let result = install_library(&mut fake).expect("no error");
+
+    assert!(result.is_none());
+    assert!(fake.writes.is_empty());
+}
+
+#[test]
+fn a_library_replaced_on_disk_is_refused() {
+    let mut fake = dynamic_fake(vec![]);
+    map_library(
+        &mut fake,
+        library_image(),
+        LIBRARY_BASE,
+        LIBRARY_INODE,
+        LIBRARY_PATH,
+        "r-xp",
+    );
+    fake.files.insert(
+        LIBRARY_PATH.to_string(),
+        (LIBRARY_INODE + 1, library_image().to_vec()),
+    );
+
+    let result = install_library(&mut fake);
+
+    assert!(
+        matches!(result, Err(InstallError::LibraryChanged(reason)) if reason == "the file on disk is not the file that is mapped"),
+        "got {result:?}"
+    );
+    assert!(fake.writes.is_empty());
+}
+
+#[test]
+fn live_library_code_that_differs_from_the_file_is_refused() {
+    let mut fake = dynamic_fake(vec![]);
+    map_library(
+        &mut fake,
+        library_image(),
+        LIBRARY_BASE,
+        LIBRARY_INODE,
+        LIBRARY_PATH,
+        "r-xp",
+    );
+    let text = library_text(LIBRARY_BASE);
+    let flipped = fake.at(text) ^ 0xff;
+    fake.poke(text, &[flipped]);
+
+    let result = install_library(&mut fake);
+
+    assert!(
+        matches!(result, Err(InstallError::LibraryChanged(reason)) if reason == "the mapped code differs from the file"),
+        "got {result:?}"
+    );
+    assert!(fake.writes.is_empty());
+}
+
+#[test]
+fn a_mapped_library_whose_file_is_missing_is_an_io_error() {
+    let mut fake = dynamic_fake(vec![]);
+    map_file(
+        &mut fake,
+        LIBRARY_BASE,
+        LIBRARY_BASE + PAGE,
+        "r-xp",
+        0,
+        LIBRARY_INODE,
+        LIBRARY_PATH,
+    );
+
+    let result = install_library(&mut fake);
+
+    assert!(matches!(result, Err(InstallError::Io(_))), "got {result:?}");
+}
+
+#[test]
+fn a_mapped_library_whose_file_does_not_parse_is_a_parse_error() {
+    let mut fake = dynamic_fake(vec![]);
+    map_file(
+        &mut fake,
+        LIBRARY_BASE,
+        LIBRARY_BASE + PAGE,
+        "r-xp",
+        0,
+        LIBRARY_INODE,
+        LIBRARY_PATH,
+    );
+    fake.files
+        .insert(LIBRARY_PATH.to_string(), (LIBRARY_INODE, b"junk".to_vec()));
+
+    let result = install_library(&mut fake);
+
+    assert!(
+        matches!(result, Err(InstallError::Parse(_))),
+        "got {result:?}"
+    );
+}
+
+#[test]
+fn a_library_with_no_segment_at_file_offset_zero_is_refused() {
+    let mut fake = dynamic_fake(vec![]);
+    map_file(
+        &mut fake,
+        LIBRARY_BASE,
+        LIBRARY_BASE + PAGE,
+        "r-xp",
+        0,
+        LIBRARY_INODE,
+        LIBRARY_PATH,
+    );
+    fake.files.insert(
+        LIBRARY_PATH.to_string(),
+        (LIBRARY_INODE, header_with_segment(PAGE, PAGE)),
+    );
+
+    let result = install_library(&mut fake);
+
+    assert!(
+        matches!(result, Err(InstallError::LibraryChanged(reason)) if reason == "no loadable segment maps file offset zero at a valid address"),
+        "got {result:?}"
+    );
+}
+
+#[test]
+fn a_library_whose_base_would_lie_below_address_zero_is_refused() {
+    let mut fake = dynamic_fake(vec![]);
+    map_file(
+        &mut fake,
+        PAGE,
+        2 * PAGE,
+        "r-xp",
+        0,
+        LIBRARY_INODE,
+        LIBRARY_PATH,
+    );
+    fake.files.insert(
+        LIBRARY_PATH.to_string(),
+        (LIBRARY_INODE, header_with_segment(0, 0x2000)),
+    );
+
+    let result = install_library(&mut fake);
+
+    assert!(
+        matches!(result, Err(InstallError::LibraryChanged(reason)) if reason == "no loadable segment maps file offset zero at a valid address"),
+        "got {result:?}"
+    );
+}
+
+#[test]
+fn a_stripped_library_missing_a_hooked_name_is_refused() {
+    let mut fake = dynamic_fake(vec![]);
+    let image = with_renamed_symbol(stripped_library_image(), "realloc", "xealloc");
+    map_library(
+        &mut fake,
+        &image,
+        LIBRARY_BASE,
+        LIBRARY_INODE,
+        LIBRARY_PATH,
+        "r-xp",
+    );
+
+    let result = install_library(&mut fake);
+
+    assert!(
+        matches!(result, Err(InstallError::MissingSymbol("realloc"))),
+        "got {result:?}"
+    );
+    assert!(fake.writes.is_empty());
+}
+
+#[test]
+fn a_library_with_no_room_in_reach_is_refused() {
+    let mut fake = dynamic_fake(vec![]);
+    map_library(
+        &mut fake,
+        library_image(),
+        LIBRARY_BASE,
+        LIBRARY_INODE,
+        LIBRARY_PATH,
+        "r-xp",
+    );
+    map_line(&mut fake, 0, 0x7fff_ffff_ffff, "rw-p");
+
+    let result = install_library(&mut fake);
+
+    assert!(
+        matches!(result, Err(InstallError::NoRegion)),
+        "got {result:?}"
+    );
+    assert!(fake.writes.is_empty());
+}
+
+#[test]
+fn a_failed_read_of_the_library_code_is_an_io_error() {
+    let mut fake = dynamic_fake(vec![]);
+    map_library(
+        &mut fake,
+        library_image(),
+        LIBRARY_BASE,
+        LIBRARY_INODE,
+        LIBRARY_PATH,
+        "r-xp",
+    );
+    fake.fail_reads = true;
+
+    let result = install_library(&mut fake);
+
+    assert!(matches!(result, Err(InstallError::Io(_))), "got {result:?}");
+}
+
+#[test]
+fn a_failed_maps_read_is_an_io_error() {
+    let mut fake = dynamic_fake(vec![]);
+    fake.fail_at = Some(0);
+
+    let result = install_library(&mut fake);
+
+    assert!(matches!(result, Err(InstallError::Io(_))), "got {result:?}");
 }
 
 #[test]

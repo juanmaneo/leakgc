@@ -16,10 +16,16 @@ fn target_dir() -> &'static Path {
 
 /// Compiles `tests/fixtures/<source>` into the target temp directory.
 fn build_c(source: &str, flags: &[&str]) -> PathBuf {
+    build_c_named(source, source.trim_end_matches(".c"), flags)
+}
+
+/// Like `build_c`, with an explicit output name, so one source can be built in
+/// several link modes.
+fn build_c_named(source: &str, out_name: &str, flags: &[&str]) -> PathBuf {
     let src = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(source);
-    let out = target_dir().join(source.trim_end_matches(".c"));
+    let out = target_dir().join(out_name);
     let status = Command::new("cc")
         .arg(&src)
         .arg("-o")
@@ -102,6 +108,44 @@ fn static_binary_reports_its_outstanding_blocks_by_caller() {
     assert!(log.contains("exit code 0"), "log:\n{log}");
     assert!(!log.contains("not covered"), "log:\n{log}");
     assert!(!log.contains("unknown frees"), "log:\n{log}");
+    assert!(!log.contains("R40"), "log:\n{log}");
+}
+
+/// A dynamic program links the system C library at run time, so the hooks go in
+/// only once that library is mapped. The blocks still reach the report. The
+/// system library here has no symbol names for its internal functions, so the
+/// report says no block is freed by injection.
+#[test]
+fn dynamic_binary_reports_its_outstanding_blocks_after_the_library_is_mapped() {
+    let hooks = build_c_named("hooks_static.c", "hooks_dynamic", &["-no-pie"]);
+    let path = hooks.to_str().expect("UTF-8 path");
+    let (status, log) = run_leakgc(&[path], &[("LEAKGC_LOG", "1")]);
+
+    assert_eq!(status.code(), Some(0), "log:\n{log}");
+    assert!(
+        log.contains("hooks were installed after the C library was mapped"),
+        "log:\n{log}"
+    );
+    assert!(log.contains("1 blocks, 200 bytes"), "log:\n{log}");
+    assert!(log.contains("1 blocks, 40000 bytes"), "log:\n{log}");
+    assert!(log.contains("exit code 0"), "log:\n{log}");
+    assert!(!log.contains("not covered"), "log:\n{log}");
+    assert!(!log.contains("unknown frees"), "log:\n{log}");
+    assert!(!log.contains("R40"), "log:\n{log}");
+}
+
+/// The same program as a position-independent executable, which is the default
+/// build on most distributions.
+#[test]
+fn pie_binary_reports_its_outstanding_blocks_after_the_library_is_mapped() {
+    let hooks = build_c_named("hooks_static.c", "hooks_pie", &[]);
+    let path = hooks.to_str().expect("UTF-8 path");
+    let (status, log) = run_leakgc(&[path], &[("LEAKGC_LOG", "1")]);
+
+    assert_eq!(status.code(), Some(0), "log:\n{log}");
+    assert!(log.contains("1 blocks, 200 bytes"), "log:\n{log}");
+    assert!(log.contains("1 blocks, 40000 bytes"), "log:\n{log}");
+    assert!(!log.contains("not covered"), "log:\n{log}");
     assert!(!log.contains("R40"), "log:\n{log}");
 }
 

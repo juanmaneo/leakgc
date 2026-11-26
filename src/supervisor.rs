@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 
 use nix::errno::Errno;
 use nix::sys::ptrace::{self, Options};
@@ -82,6 +82,9 @@ pub trait Tracer {
     fn read_maps(&mut self, pid: Pid) -> io::Result<String>;
     /// The executable image as stored on disk, read through `/proc/<pid>/exe`.
     fn exe_image(&mut self, pid: Pid) -> io::Result<Vec<u8>>;
+    /// The file at `path` and its inode. The caller checks the inode against
+    /// the mapping that named the path.
+    fn file_image(&mut self, path: &str) -> io::Result<(u64, Vec<u8>)>;
     fn regs(&mut self, pid: Pid) -> nix::Result<libc::user_regs_struct>;
     fn set_regs(&mut self, pid: Pid, regs: libc::user_regs_struct) -> nix::Result<()>;
     /// Runs one instruction. If the stopped thread is at a trapped system call,
@@ -154,6 +157,14 @@ impl Tracer for OsTracer {
 
     fn exe_image(&mut self, pid: Pid) -> io::Result<Vec<u8>> {
         std::fs::read(format!("/proc/{}/exe", pid.as_raw()))
+    }
+
+    /// The inode is read before the bytes. A replacement in between makes the
+    /// two disagree, and the mapping check then refuses the library.
+    fn file_image(&mut self, path: &str) -> io::Result<(u64, Vec<u8>)> {
+        let inode = std::fs::metadata(path)?.ino();
+        let bytes = std::fs::read(path)?;
+        Ok((inode, bytes))
     }
 
     fn regs(&mut self, pid: Pid) -> nix::Result<libc::user_regs_struct> {
@@ -334,7 +345,8 @@ impl<T: Tracer> Session<'_, '_, T> {
                 }
             }
             Event::SyscallExit(pid) => {
-                self.monitor.syscall_exited(&mut *self.tracer, pid);
+                let pending_signals = self.monitor.syscall_exited(&mut *self.tracer, pid);
+                self.requeue(pid, pending_signals);
                 let _ = self.tracer.cont(pid, None);
             }
             Event::Exec(pid) => {

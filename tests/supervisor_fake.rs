@@ -167,6 +167,13 @@ impl Tracer for Fake {
         }
     }
 
+    fn file_image(&mut self, path: &str) -> io::Result<(u64, Vec<u8>)> {
+        match self.install.as_mut() {
+            Some(install) => install.file_image(path),
+            None => Err(io::Error::other("no file in the scripted tracer")),
+        }
+    }
+
     fn regs(&mut self, pid: Pid) -> nix::Result<libc::user_regs_struct> {
         self.install
             .as_mut()

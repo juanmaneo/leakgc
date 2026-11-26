@@ -1,6 +1,7 @@
-//! Installs the E4 entry hooks on the glibc allocator entries in a stopped,
-//! static, non-PIE process (PLAN 4.6). It runs at the exec-stop, before the
-//! target executes anything.
+//! Installs the E4 entry hooks on the glibc allocator entries (PLAN 4.6). A
+//! static, non-PIE process is hooked at its exec-stop, before it executes
+//! anything. A dynamically linked process is hooked in its C library, once the
+//! dynamic loader has mapped that library's code (P2b-4).
 //!
 //! Every check that can refuse runs before the target is touched. Each function
 //! is planned and its original bytes are read first. Only then is an `mmap`
@@ -17,7 +18,10 @@ use std::io;
 
 use goblin::elf::Elf;
 use goblin::elf::header::ET_EXEC;
-use goblin::elf::section_header::SHT_NOBITS;
+use goblin::elf::program_header::PT_LOAD;
+use goblin::elf::section_header::{SHN_UNDEF, SHT_NOBITS, SectionHeader};
+use goblin::elf::sym::Symtab;
+use goblin::strtab::Strtab;
 use iced_x86::code_asm::*;
 use libc::user_regs_struct;
 use nix::errno::Errno;
@@ -27,6 +31,7 @@ use nix::unistd::Pid;
 
 use crate::hook::{self, JMP_LEN, Refusal};
 use crate::inject::is_allocator_internal;
+use crate::maps;
 use crate::ring::{CAPACITY, Kind, RECORD_LEN};
 use crate::supervisor::{PTRACE_EVENT_SECCOMP, Tracer};
 
@@ -67,6 +72,12 @@ const MAX_SECCOMP_STOPS: usize = 4;
 const ASM: &str = "trampoline instruction assembles";
 const ASM_NEW: &str = "64-bit assembler is available";
 const LAYOUT: &str = "block code fits its slot";
+/// The shared C library whose allocator entries a dynamic process gets hooked.
+const C_LIBRARY: &str = "libc.so.6";
+/// How far a `jmp rel32` reaches, less a margin. The hook region is placed within
+/// this distance of every mapping of the library (D55).
+const REL32_REACH: u64 = 0x7000_0000;
+const PAGE: u64 = 0x1000;
 
 const _: () = assert!(RECORD_LEN == 64);
 const _: () = assert!(PENDING_OFFSET + 0x1_0000 == RECORDS_OFFSET);
@@ -183,8 +194,16 @@ pub enum InstallError {
     Os(Errno),
     /// The ELF image does not parse.
     Parse(String),
-    /// The image is not a static, non-PIE executable (PLAN 4.6).
+    /// The image is not a static executable at a fixed address, such as a
+    /// static-PIE image (PLAN 4.6).
     NotStaticExecutable,
+    /// The image is dynamically linked. It is hooked through its C library once
+    /// that library is mapped (P2b-4).
+    Dynamic,
+    /// The C library cannot be hooked, because its mapping does not match its file.
+    LibraryChanged(&'static str),
+    /// No gap of the hook region's length lies within reach of the C library.
+    NoRegion,
     /// No function symbol with this name lies in an executable section.
     MissingSymbol(&'static str),
     /// The planner refused an entry point, which stays fail-closed (D29).
@@ -240,10 +259,27 @@ pub fn install_hooks_at<T: Tracer>(
 ) -> Result<Installed, InstallError> {
     let image = tracer.exe_image(pid)?;
     let elf = Elf::parse(&image).map_err(|error| InstallError::Parse(error.to_string()))?;
-    if elf.header.e_type != ET_EXEC || elf.interpreter.is_some() {
+    if elf.interpreter.is_some() {
+        return Err(InstallError::Dynamic);
+    }
+    if elf.header.e_type != ET_EXEC {
         return Err(InstallError::NotStaticExecutable);
     }
-    let text = exec_sections(tracer, pid, &elf)?;
+    let text = exec_sections(tracer, pid, &elf, 0)?;
+    install_core(tracer, pid, &elf, 0, &text, hint, pending_signals)
+}
+
+/// Plans and writes the hooks for an image whose executable sections are
+/// `text`, at addresses biased by `bias`. See [`install_hooks_at`].
+fn install_core<T: Tracer>(
+    tracer: &mut T,
+    pid: Pid,
+    elf: &Elf,
+    bias: u64,
+    text: &[(u64, Vec<u8>)],
+    hint: u64,
+    pending_signals: &mut Vec<Signal>,
+) -> Result<Installed, InstallError> {
     let refs: Vec<(u64, &[u8])> = text
         .iter()
         .map(|(start, code)| (*start, code.as_slice()))
@@ -251,7 +287,7 @@ pub fn install_hooks_at<T: Tracer>(
 
     let mut planned = Vec::with_capacity(HOOKS.len());
     for hook in &HOOKS {
-        let (addr, function) = function_symbol(&elf, &text, hook.symbol)
+        let (addr, function) = function_symbol(elf, bias, text, hook.symbol)
             .ok_or(InstallError::MissingSymbol(hook.symbol))?;
         let block = hint + hook.block;
         let plan = hook::plan(addr, function, &refs, block, block + DISPLACED_OFFSET)?;
@@ -260,7 +296,7 @@ pub fn install_hooks_at<T: Tracer>(
         planned.push((hook, plan, original));
     }
 
-    let (free, _) = function_symbol(&elf, &text, "free")
+    let (free, _) = function_symbol(elf, bias, text, "free")
         .expect("the planning loop found free, which is a hook");
     burn_exec_step(tracer, pid, pending_signals)?;
     let mapped = run_syscall(
@@ -308,8 +344,50 @@ pub fn install_hooks_at<T: Tracer>(
         patches,
         trampoline: hint + INJECT_OFFSET,
         stop,
-        internal: allocator_internals(&elf),
+        internal: allocator_internals(elf, bias),
     })
+}
+
+/// Installs the hooks in the C library of a dynamically linked process. Call it
+/// at each trapped `mmap` exit until it returns `Some`. It returns `None` while
+/// the library is absent or has no executable mapping yet (P2b-4).
+///
+/// The library's file is read, and every executable section of its live code
+/// must equal the file's bytes, or nothing is written. The hook region is
+/// placed within rel32 reach of the library. Signal-delivery stops are appended
+/// to `pending_signals`, as for [`install_hooks_at`].
+pub fn install_library_hooks<T: Tracer>(
+    tracer: &mut T,
+    pid: Pid,
+    pending_signals: &mut Vec<Signal>,
+) -> Result<Option<Installed>, InstallError> {
+    let map = tracer.read_maps(pid)?;
+    let Some(library) = maps::library(&map, C_LIBRARY) else {
+        return Ok(None);
+    };
+    if !library.executable {
+        return Ok(None);
+    }
+    let (inode, file) = tracer.file_image(&library.path)?;
+    if inode != library.inode {
+        return Err(InstallError::LibraryChanged(
+            "the file on disk is not the file that is mapped",
+        ));
+    }
+    let elf = Elf::parse(&file).map_err(|error| InstallError::Parse(error.to_string()))?;
+    let base = load_base(&elf, library.file_start).ok_or(InstallError::LibraryChanged(
+        "no loadable segment maps file offset zero at a valid address",
+    ))?;
+    let text = exec_sections(tracer, pid, &elf, base)?;
+    if !matches_file(&elf, &file, &text) {
+        return Err(InstallError::LibraryChanged(
+            "the mapped code differs from the file",
+        ));
+    }
+    let (low, high) = library.span;
+    let window = high.saturating_sub(REL32_REACH)..low.saturating_add(REL32_REACH);
+    let hint = maps::find_gap(&map, window, REGION_LEN, PAGE).ok_or(InstallError::NoRegion)?;
+    install_core(tracer, pid, &elf, base, &text, hint, pending_signals).map(Some)
 }
 
 /// Writes the original bytes back over every jump in `installed`. The region
@@ -330,52 +408,103 @@ fn restore<T: Tracer>(tracer: &mut T, pid: Pid, patches: &[Patch]) {
     }
 }
 
+/// The executable section headers that hold code: not `NOBITS`, and not empty.
+fn exec_headers<'a>(elf: &'a Elf<'a>) -> impl Iterator<Item = &'a SectionHeader> {
+    elf.section_headers
+        .iter()
+        .filter(|sh| sh.is_executable() && sh.sh_type != SHT_NOBITS && sh.sh_size > 0)
+}
+
 /// The executable sections, read from the live process rather than the file,
-/// so the bytes planned are the bytes that will run.
+/// so the bytes planned are the bytes that will run. `bias` is the address at
+/// which the image is loaded, or 0 for a static executable.
 fn exec_sections<T: Tracer>(
     tracer: &mut T,
     pid: Pid,
     elf: &Elf,
+    bias: u64,
 ) -> Result<Vec<(u64, Vec<u8>)>, InstallError> {
-    elf.section_headers
-        .iter()
-        .filter(|sh| sh.is_executable() && sh.sh_type != SHT_NOBITS && sh.sh_size > 0)
+    exec_headers(elf)
         .map(|sh| -> Result<(u64, Vec<u8>), InstallError> {
-            let bytes = tracer.read_mem(pid, sh.sh_addr, sh.sh_size as usize)?;
-            Ok((sh.sh_addr, bytes))
+            let start = bias.saturating_add(sh.sh_addr);
+            let bytes = tracer.read_mem(pid, start, sh.sh_size as usize)?;
+            Ok((start, bytes))
         })
         .collect()
 }
 
-/// The address and bytes of the function symbol `name`.
+/// Whether the live code of every executable section equals the file's bytes.
+fn matches_file(elf: &Elf, file: &[u8], text: &[(u64, Vec<u8>)]) -> bool {
+    exec_headers(elf).zip(text).all(|(sh, (_, live))| {
+        file.get(sh.sh_offset as usize..)
+            .and_then(|rest| rest.get(..sh.sh_size as usize))
+            == Some(live.as_slice())
+    })
+}
+
+/// The load base of a shared object: the address at which its file offset zero
+/// is mapped, given where that mapping starts. `None` if no loadable segment
+/// begins at file offset zero, or if the base would lie below address zero.
+fn load_base(elf: &Elf, file_start: u64) -> Option<u64> {
+    let first = elf
+        .program_headers
+        .iter()
+        .find(|ph| ph.p_type == PT_LOAD && ph.p_offset == 0)?;
+    file_start.checked_sub(first.p_vaddr & !(PAGE - 1))
+}
+
+/// The address and bytes of the function symbol `name`. The address is biased
+/// by `bias`, the same as `text`.
 fn function_symbol<'a>(
     elf: &Elf,
+    bias: u64,
     text: &'a [(u64, Vec<u8>)],
     name: &str,
 ) -> Option<(u64, &'a [u8])> {
-    let sym = elf
-        .syms
-        .iter()
-        .find(|sym| sym.is_function() && elf.strtab.get_at(sym.st_name) == Some(name))?;
+    let (value, size) = find_function(elf, name)?;
+    let addr = bias.saturating_add(value);
     let (start, code) = text
         .iter()
-        .find(|(start, code)| (*start..*start + code.len() as u64).contains(&sym.st_value))?;
-    let from = (sym.st_value - *start) as usize;
-    let function = code.get(from..from + sym.st_size as usize).unwrap_or(&[]);
-    Some((sym.st_value, function))
+        .find(|(start, code)| (*start..*start + code.len() as u64).contains(&addr))?;
+    let from = (addr - *start) as usize;
+    let function = code
+        .get(from..)
+        .and_then(|rest| rest.get(..size as usize))
+        .unwrap_or(&[]);
+    Some((addr, function))
+}
+
+/// The value and size of the function symbol `name`. The symbol table is
+/// searched first, then the dynamic symbol table, which a stripped C library
+/// still has.
+fn find_function(elf: &Elf, name: &str) -> Option<(u64, u64)> {
+    named_function(&elf.syms, &elf.strtab, name)
+        .or_else(|| named_function(&elf.dynsyms, &elf.dynstrtab, name))
+}
+
+/// The value and size of the defined function symbol `name` in one symbol table.
+fn named_function(syms: &Symtab, strtab: &Strtab, name: &str) -> Option<(u64, u64)> {
+    syms.iter()
+        .find(|sym| {
+            sym.is_function()
+                && sym.st_shndx != SHN_UNDEF as usize
+                && strtab.get_at(sym.st_name) == Some(name)
+        })
+        .map(|sym| (sym.st_value, sym.st_size))
 }
 
 /// The `[start, end)` ranges of glibc's internal allocator functions, found by
 /// name. `None` unless `_int_malloc` is present, so a build this module does not
 /// recognise is never injected into (R37).
-fn allocator_internals(elf: &Elf) -> Option<Vec<(u64, u64)>> {
+fn allocator_internals(elf: &Elf, bias: u64) -> Option<Vec<(u64, u64)>> {
     let functions: Vec<(&str, u64, u64)> = elf
         .syms
         .iter()
         .filter(|sym| sym.is_function())
         .map(|sym| {
             let name = elf.strtab.get_at(sym.st_name).unwrap_or("");
-            (name, sym.st_value, sym.st_value.saturating_add(sym.st_size))
+            let start = bias.saturating_add(sym.st_value);
+            (name, start, start.saturating_add(sym.st_size))
         })
         .collect();
     let glibc = functions.iter().any(|(name, _, _)| *name == "_int_malloc");

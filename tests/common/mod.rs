@@ -104,6 +104,11 @@ pub struct Fake {
     pub writes: Vec<(u64, Vec<u8>)>,
     pub signals: Vec<Signal>,
     pub maps: String,
+    /// The files `file_image` can read, by path: the inode and the bytes.
+    pub files: BTreeMap<String, (u64, Vec<u8>)>,
+    /// Makes an injected `mmap` return its requested address, as a real kernel does
+    /// for a fixed hint, instead of `mmap_result`.
+    pub mmap_echoes_hint: bool,
 }
 
 impl Fake {
@@ -145,6 +150,8 @@ impl Fake {
             writes: Vec::new(),
             signals: Vec::new(),
             maps: String::new(),
+            files: BTreeMap::new(),
+            mmap_echoes_hint: false,
         }
     }
 
@@ -224,6 +231,13 @@ impl Tracer for Fake {
         Ok(self.image.clone())
     }
 
+    fn file_image(&mut self, path: &str) -> io::Result<(u64, Vec<u8>)> {
+        self.files
+            .get(path)
+            .cloned()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+    }
+
     fn regs(&mut self, _pid: Pid) -> nix::Result<user_regs_struct> {
         if self.fail_regs || self.fails() {
             return Err(Errno::EIO);
@@ -249,7 +263,11 @@ impl Tracer for Fake {
         let rip = self.regs.rip;
         if self.syscall_advances && self.at(rip) == SYSCALL[0] && self.at(rip + 1) == SYSCALL[1] {
             self.regs.rax = if self.regs.rax == libc::SYS_mmap as u64 {
-                self.mmap_result as u64
+                if self.mmap_echoes_hint {
+                    self.regs.rdi
+                } else {
+                    self.mmap_result as u64
+                }
             } else {
                 0
             };
@@ -391,4 +409,99 @@ pub fn static_image() -> &'static [u8] {
 
 pub fn dynamic_image() -> &'static [u8] {
     DYNAMIC_IMAGE.get_or_init(|| build_c("install_fake_dynamic", &["-no-pie"]))
+}
+
+pub const LIBRARY_BASE: u64 = 0x7f00_0000_0000;
+pub const LIBRARY_PATH: &str = "/fake/libc.so.6";
+pub const LIBRARY_INODE: u64 = 42;
+pub const PAGE: u64 = 0x1000;
+/// The rel32 reach that the install's hook region must lie within.
+pub const REL32_WINDOW: u64 = 0x7000_0000;
+
+pub static LIBRARY_IMAGE: OnceLock<Vec<u8>> = OnceLock::new();
+pub static STRIPPED_LIBRARY_IMAGE: OnceLock<Vec<u8>> = OnceLock::new();
+
+fn build_library(out_name: &str, flags: &[&str]) -> Vec<u8> {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_libc.c");
+    let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join(out_name);
+    let status = Command::new("cc")
+        .args(["-O0", "-shared", "-fPIC", "-Wl,-soname,libc.so.6"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)
+        .args(flags)
+        .status()
+        .expect("run cc");
+    assert!(status.success(), "cc failed for {out_name}");
+    std::fs::read(&out).expect("read the built library")
+}
+
+/// A shared object named `libc.so.6` with its symbol table.
+pub fn library_image() -> &'static [u8] {
+    LIBRARY_IMAGE.get_or_init(|| build_library("fake_libc", &[]))
+}
+
+/// The same library with its symbol table removed, as distributions ship it.
+pub fn stripped_library_image() -> &'static [u8] {
+    STRIPPED_LIBRARY_IMAGE.get_or_init(|| build_library("fake_libc_stripped", &["-Wl,--strip-all"]))
+}
+
+/// Adds one `/proc/<pid>/maps` line for a file mapping.
+pub fn map_file(
+    fake: &mut Fake,
+    start: u64,
+    end: u64,
+    perms: &str,
+    offset: u64,
+    inode: u64,
+    path: &str,
+) {
+    fake.maps.push_str(&format!(
+        "{start:x}-{end:x} {perms} {offset:08x} 08:01 {inode} {path}\n"
+    ));
+}
+
+/// The page-rounded length of the mapping that `map_library` makes for `image`.
+pub fn library_len(image: &[u8]) -> u64 {
+    let elf = Elf::parse(image).expect("library parses");
+    elf.section_headers
+        .iter()
+        .filter(|sh| sh.sh_flags & u64::from(SHF_ALLOC) != 0)
+        .map(|sh| sh.sh_addr + sh.sh_size)
+        .max()
+        .unwrap_or(0)
+        .next_multiple_of(PAGE)
+}
+
+/// A load base for `image` that puts the install's hook region at `DEFAULT_HINT`,
+/// the address that the record helpers in this module assume.
+pub fn library_base_at_hint(image: &[u8]) -> u64 {
+    DEFAULT_HINT + REL32_WINDOW - library_len(image)
+}
+
+/// Maps `image` at `base` as one mapping of `path`, and makes the file readable
+/// under that path. Only the loaded sections are written to memory, at their
+/// addresses, as the dynamic loader leaves them.
+pub fn map_library(fake: &mut Fake, image: &[u8], base: u64, inode: u64, path: &str, perms: &str) {
+    let elf = Elf::parse(image).expect("library parses");
+    let loaded = || {
+        elf.section_headers
+            .iter()
+            .filter(|sh| sh.sh_flags & u64::from(SHF_ALLOC) != 0)
+    };
+    map_file(fake, base, base + library_len(image), perms, 0, inode, path);
+    for sh in loaded().filter(|sh| sh.sh_type == SHT_PROGBITS) {
+        let start = sh.sh_offset as usize;
+        let end = start + sh.sh_size as usize;
+        fake.poke(base + sh.sh_addr, &image[start..end]);
+    }
+    fake.files.insert(path.to_string(), (inode, image.to_vec()));
+}
+
+/// A dynamically linked tracee, with `mmap` returning the address it asks for.
+/// The install needs that, since a real kernel honours the hint it is given.
+pub fn dynamic_fake(waits: Vec<nix::Result<WaitStatus>>) -> Fake {
+    let mut fake = Fake::new(dynamic_image(), waits);
+    fake.mmap_echoes_hint = true;
+    fake
 }
