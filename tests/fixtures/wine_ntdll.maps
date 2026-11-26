@@ -1,0 +1,32 @@
+6ffffe910000-6ffffe911000 r--p 00000000 103:02 53118095                  /usr/lib/wine/x86_64-windows/ucrtbase.dll
+6ffffe911000-6ffffe9a3000 r-xp 00001000 103:02 53118095                  /usr/lib/wine/x86_64-windows/ucrtbase.dll
+6ffffe9a3000-6ffffe9a5000 rw-p 00093000 103:02 53118095                  /usr/lib/wine/x86_64-windows/ucrtbase.dll
+6ffffe9a5000-6ffffe9d2000 r--p 00095000 103:02 53118095                  /usr/lib/wine/x86_64-windows/ucrtbase.dll
+6ffffe9d2000-6ffffe9d5000 rw-p 00000000 00:00 0 
+6ffffe9d5000-6ffffe9e7000 r--p 000c2000 103:02 53118095                  /usr/lib/wine/x86_64-windows/ucrtbase.dll
+6ffffe9e7000-6ffffed58000 rw-p 00000000 00:00 0 
+6ffffed58000-6ffffed59000 r--p 000d4000 103:02 53118095                  /usr/lib/wine/x86_64-windows/ucrtbase.dll
+6fffff320000-6fffff321000 r--p 00000000 103:02 53117349                  /usr/lib/wine/x86_64-windows/kernelbase.dll
+6fffff321000-6fffff3b3000 r-xp 00001000 103:02 53117349                  /usr/lib/wine/x86_64-windows/kernelbase.dll
+6fffff3b3000-6fffff3b5000 rw-p 00093000 103:02 53117349                  /usr/lib/wine/x86_64-windows/kernelbase.dll
+6fffff3b5000-6fffff3e5000 r--p 00095000 103:02 53117349                  /usr/lib/wine/x86_64-windows/kernelbase.dll
+6fffff3e5000-6fffff3e8000 rw-p 00000000 00:00 0 
+6fffff3e8000-6fffff5e3000 r--p 000c5000 103:02 53117349                  /usr/lib/wine/x86_64-windows/kernelbase.dll
+6fffff5e3000-6fffff9a6000 rw-p 00000000 00:00 0 
+6fffff9a6000-6fffff9a7000 r--p 002c0000 103:02 53117349                  /usr/lib/wine/x86_64-windows/kernelbase.dll
+6fffff9c0000-6fffff9c1000 r--p 00000000 103:02 53117348                  /usr/lib/wine/x86_64-windows/kernel32.dll
+6fffff9c1000-6fffff9f4000 r-xp 00001000 103:02 53117348                  /usr/lib/wine/x86_64-windows/kernel32.dll
+6fffff9f4000-6fffff9f5000 rw-p 00034000 103:02 53117348                  /usr/lib/wine/x86_64-windows/kernel32.dll
+6fffff9f5000-6fffffa06000 r--p 00035000 103:02 53117348                  /usr/lib/wine/x86_64-windows/kernel32.dll
+6fffffa06000-6fffffa07000 rw-p 00000000 00:00 0 
+6fffffa07000-6fffffa23000 r--p 00046000 103:02 53117348                  /usr/lib/wine/x86_64-windows/kernel32.dll
+6fffffa23000-6fffffb8c000 rw-p 00000000 00:00 0 
+6fffffb8c000-6fffffb8d000 r--p 00062000 103:02 53117348                  /usr/lib/wine/x86_64-windows/kernel32.dll
+6fffffba0000-6fffffba1000 r--p 00000000 103:02 53117937                  /usr/lib/wine/x86_64-windows/ntdll.dll
+6fffffba1000-6fffffc23000 r-xp 00001000 103:02 53117937                  /usr/lib/wine/x86_64-windows/ntdll.dll
+6fffffc23000-6fffffc24000 rw-p 00083000 103:02 53117937                  /usr/lib/wine/x86_64-windows/ntdll.dll
+6fffffc24000-6fffffc4e000 r--p 00084000 103:02 53117937                  /usr/lib/wine/x86_64-windows/ntdll.dll
+6fffffc4e000-6fffffc52000 rw-p 00000000 00:00 0 
+6fffffc52000-6fffffc60000 r--p 000ae000 103:02 53117937                  /usr/lib/wine/x86_64-windows/ntdll.dll
+6fffffc60000-6ffffffe6000 rw-p 00000000 00:00 0 
+6ffffffe6000-6ffffffe7000 r--p 000bc000 103:02 53117937                  /usr/lib/wine/x86_64-windows/ntdll.dll

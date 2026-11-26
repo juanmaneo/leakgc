@@ -1,4 +1,4 @@
-use leakgc::maps::{ScanRanges, scan_ranges, writable_count};
+use leakgc::maps::{ScanRanges, find_gap, scan_ranges, writable_count};
 
 #[test]
 fn counts_only_mappings_with_write_permission() {
@@ -79,4 +79,100 @@ fn scan_ranges_is_none_when_any_line_does_not_parse() {
     for maps in malformed {
         assert_eq!(scan_ranges(maps), None, "maps {maps:?}");
     }
+}
+
+#[test]
+fn find_gap_is_none_when_any_line_does_not_parse() {
+    let malformed = [
+        "\n",
+        "not a mapping\n",
+        "00400000 rw-p\n",
+        "zz-00401000 rw-p\n",
+        "00400000-zz rw-p\n",
+        "00401000-00400000 rw-p\n",
+        "00600000-00601000 rw-p\nnot a mapping\n",
+    ];
+    for maps in malformed {
+        assert_eq!(find_gap(maps, 0..0x10000, 1, 1), None, "maps {maps:?}");
+    }
+}
+
+#[test]
+fn find_gap_returns_the_window_start_when_nothing_is_mapped() {
+    assert_eq!(find_gap("", 0x1001..0x9000, 0x100, 0x1000), Some(0x2000));
+}
+
+#[test]
+fn find_gap_ignores_a_mapping_that_ends_before_the_window() {
+    assert_eq!(
+        find_gap("00000100-00000800 rw-p\n", 0x1000..0x2000, 0x1000, 1),
+        Some(0x1000)
+    );
+}
+
+#[test]
+fn find_gap_uses_a_gap_before_the_first_mapping() {
+    assert_eq!(
+        find_gap("00004000-00005000 rw-p\n", 0x1000..0x9000, 0x2000, 1),
+        Some(0x1000)
+    );
+}
+
+#[test]
+fn find_gap_moves_past_a_mapping_that_overlaps_the_window_start() {
+    let maps = "00000f00-00002100 rw-p\n";
+    assert_eq!(find_gap(maps, 0x1000..0x9000, 0x100, 1), Some(0x2100));
+    assert_eq!(find_gap(maps, 0x1000..0x9000, 0x100, 0x1000), Some(0x3000));
+}
+
+#[test]
+fn find_gap_skips_a_gap_that_is_too_small() {
+    let maps = "00002000-00003000 rw-p\n00003800-00004000 rw-p\n";
+    assert_eq!(find_gap(maps, 0x1000..0x8000, 0x1000, 1), Some(0x1000));
+    assert_eq!(find_gap(maps, 0x1000..0x8000, 0x1800, 1), Some(0x4000));
+}
+
+#[test]
+fn find_gap_sorts_the_mappings_before_it_scans_them() {
+    let maps = "00004000-00005000 rw-p\n00002000-00003000 rw-p\n";
+    assert_eq!(find_gap(maps, 0x2000..0x6000, 0x1000, 1), Some(0x3000));
+}
+
+#[test]
+fn find_gap_is_none_when_the_window_is_too_small() {
+    let maps = "00002000-00003000 rw-p\n";
+    assert_eq!(find_gap(maps, 0x1000..0x2800, 0x1800, 1), None);
+    assert_eq!(find_gap(maps, 0x1000..0x2800, 0x1000, 1), Some(0x1000));
+    assert_eq!(find_gap("", 0x1000..0x2000, 0x1000, 1), Some(0x1000));
+}
+
+#[test]
+fn find_gap_treats_align_zero_as_one() {
+    assert_eq!(find_gap("", 0x1001..0x2000, 1, 0), Some(0x1001));
+}
+
+#[test]
+fn find_gap_is_none_on_address_overflow() {
+    assert_eq!(find_gap("", u64::MAX..u64::MAX, 1, 0x1000), None);
+    assert_eq!(find_gap("", (u64::MAX - 0x10)..u64::MAX, 0x100, 1), None);
+    assert_eq!(
+        find_gap(
+            "00001000-ffffffffffffffff rw-p\n",
+            0x1000..u64::MAX,
+            0x100,
+            0x1000
+        ),
+        None
+    );
+}
+
+#[test]
+fn find_gap_places_the_hook_region_in_the_wine_ntdll_gap() {
+    let maps = include_str!("fixtures/wine_ntdll.maps");
+    let window = 0x6fff_83ba_1000..0x7000_7bc2_3000;
+    let len = 64 << 20;
+    assert_eq!(
+        find_gap(maps, window, len, 0x1_0000),
+        Some(0x6fff_83bb_0000)
+    );
 }
