@@ -37,10 +37,19 @@ fn build_c_named(source: &str, out_name: &str, flags: &[&str]) -> PathBuf {
     out
 }
 
+/// Runs `leakgc` with only the variables given here. `cargo test` sets
+/// `LD_LIBRARY_PATH`, and a static C library reads it at startup and allocates
+/// for it. That changes the traced program's blocks and its reachability, so a
+/// run must not inherit the test runner's environment.
 fn run_leakgc(args: &[&str], env: &[(&str, &str)]) -> (ExitStatus, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_leakgc"))
-        .args(args)
-        .envs(env.iter().copied())
+    let mut command = Command::new(env!("CARGO_BIN_EXE_leakgc"));
+    command.args(args).env_clear().envs(env.iter().copied());
+    // cargo-llvm-cov sets this so the binary saves its counters. Keeping it keeps
+    // these runs in the coverage report.
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
+    let mut child = command
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn leakgc");
@@ -87,7 +96,9 @@ fn threaded_dynamic_binary_runs_to_completion_without_hanging() {
 
     assert_eq!(status.code(), Some(0), "log:\n{log}");
     assert!(log.contains("trap mmap"), "log:\n{log}");
-    assert!(log.contains("trap clone3"), "log:\n{log}");
+    // Docker's default seccomp profile makes clone3 fail with ENOSYS, so glibc
+    // falls back to clone. Either way the thread start is trapped.
+    assert!(log.contains("trap clone"), "log:\n{log}");
 }
 
 #[test]
@@ -262,7 +273,9 @@ fn static_binary_reports_only_the_block_nothing_points_to() {
 /// `mallinfo2` is glibc's own bookkeeping, not an exact byte count (tcache and
 /// top-chunk merging move it), so the test asserts a lower bound. The block that
 /// `sink` holds must keep its bytes. Without leakgc nothing is freed, so the
-/// drop is zero.
+/// drop is zero. The fixture's `mmap` runs below a zeroed buffer, so the R37
+/// check does not refuse the frees because of stale return addresses that glibc's
+/// startup leaves in `main`'s frame (see the fixture).
 #[test]
 fn static_binary_gets_its_unreached_blocks_freed_at_a_memory_call() {
     let fixture = build_c(

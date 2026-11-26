@@ -3,8 +3,18 @@
 #include <stdlib.h>
 
 void *keep[4];
-/* Referenced so that the static image defines both entries (R39). */
-void *entries[2] = {(void *)posix_memalign, (void *)malloc_trim};
+/* Referenced so that the static image defines every hooked entry (R39). A
+   static musl binary links an entry only when something references it. pvalloc
+   and malloc_trim are glibc extensions, so they are left out elsewhere. */
+void *entries[] = {
+    (void *)free,          (void *)realloc,       (void *)calloc,
+    (void *)memalign,      (void *)aligned_alloc, (void *)valloc,
+    (void *)posix_memalign,
+#ifdef __GLIBC__
+    (void *)pvalloc,
+    (void *)malloc_trim,
+#endif
+};
 
 int main(void) {
     keep[0] = malloc(16);

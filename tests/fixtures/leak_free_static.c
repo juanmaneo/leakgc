@@ -12,7 +12,12 @@ static void leak(int n) {
     }
 }
 
+/* The R37 check reads 1 KB of stack above the trapped mmap. glibc's startup
+   leaves stale return addresses into malloc in main's frame, which would refuse
+   the injected frees. Clearing a 2 KB frame here keeps that window clean. */
 static void map_page(void) {
+    volatile char pad[2048];
+    memset((char *)pad, 0, sizeof pad);
     mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 }
 
