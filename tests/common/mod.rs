@@ -11,7 +11,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use goblin::elf::Elf;
-use goblin::elf::section_header::{SHF_ALLOC, SHT_PROGBITS};
+use goblin::elf::section_header::{SHF_ALLOC, SHF_EXECINSTR, SHT_PROGBITS};
 use leakgc::install::{DEFAULT_HINT, HEAD_OFFSET, INJECT_LEN, INJECT_OFFSET, RECORDS_OFFSET};
 use leakgc::ring::{CAPACITY, Kind, RECORD_LEN, Record};
 use leakgc::supervisor::Tracer;
@@ -409,6 +409,75 @@ pub fn static_image() -> &'static [u8] {
 
 pub fn dynamic_image() -> &'static [u8] {
     DYNAMIC_IMAGE.get_or_init(|| build_c("install_fake_dynamic", &["-no-pie"]))
+}
+
+/// A copy of `image` whose function symbol `name` no longer has that name, by
+/// changing the first byte of its entry in `.strtab`. Linkers share the tail of
+/// one name with another, so the bytes `name\0` may not occur on their own.
+pub fn without_function_name(image: &[u8], name: &str) -> Vec<u8> {
+    let elf = Elf::parse(image).expect("test image parses");
+    let sym = elf
+        .syms
+        .iter()
+        .find(|sym| sym.is_function() && elf.strtab.get_at(sym.st_name) == Some(name))
+        .expect("symbol present");
+    let strtab = elf
+        .section_headers
+        .iter()
+        .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".strtab"))
+        .expect(".strtab present");
+    let mut out = image.to_vec();
+    out[strtab.sh_offset as usize + sym.st_name] = b'x';
+    out
+}
+
+/// A copy of `image` with the first occurrence of the symbol name `from`
+/// replaced by `to`, which must be the same length.
+pub fn with_renamed_symbol(image: &[u8], from: &str, to: &str) -> Vec<u8> {
+    assert_eq!(from.len(), to.len());
+    let needle = format!("\0{from}\0");
+    let at = image
+        .windows(needle.len())
+        .position(|window| window == needle.as_bytes())
+        .expect("name present")
+        + 1;
+    let mut out = image.to_vec();
+    out[at..at + to.len()].copy_from_slice(to.as_bytes());
+    out
+}
+
+/// A copy of `image` whose named section no longer has `SHF_EXECINSTR`.
+pub fn without_exec_flag(image: &[u8], name: &str) -> Vec<u8> {
+    let elf = Elf::parse(image).expect("test image parses");
+    let index = elf
+        .section_headers
+        .iter()
+        .position(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(name))
+        .expect("section present");
+    let flags_at = elf.header.e_shoff as usize + index * elf.header.e_shentsize as usize + 8;
+    let mut out = image.to_vec();
+    let flags = u64::from_le_bytes(out[flags_at..flags_at + 8].try_into().expect("8 bytes"));
+    let cleared = flags & !u64::from(SHF_EXECINSTR);
+    out[flags_at..flags_at + 8].copy_from_slice(&cleared.to_le_bytes());
+    out
+}
+
+pub fn function_symbol(image: &[u8], name: &str) -> u64 {
+    let elf = Elf::parse(image).expect("test image parses");
+    elf.syms
+        .iter()
+        .find(|sym| sym.is_function() && elf.strtab.get_at(sym.st_name) == Some(name))
+        .expect("symbol present")
+        .st_value
+}
+
+/// Where the patch goes for `malloc`: after `endbr64` when it is present.
+pub fn patch_point(fake: &Fake, malloc: u64) -> u64 {
+    if fake.bytes(malloc, ENDBR64.len()) == ENDBR64 {
+        malloc + ENDBR64.len() as u64
+    } else {
+        malloc
+    }
 }
 
 pub const LIBRARY_BASE: u64 = 0x7f00_0000_0000;

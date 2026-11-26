@@ -1,7 +1,9 @@
-//! Installs the E4 entry hooks on the glibc allocator entries (PLAN 4.6). A
+//! Installs the E4 entry hooks on the allocator entries (PLAN 4.6). A
 //! static, non-PIE process is hooked at its exec-stop, before it executes
 //! anything. A dynamically linked process is hooked in its C library, once the
-//! dynamic loader has mapped that library's code (P2b-4).
+//! dynamic loader has mapped that library's code (P2b-4). An entry that is
+//! absent from the image, or refused by the planner, is skipped and listed in
+//! `Installed::skipped`. The other entries are still hooked (D79).
 //!
 //! Every check that can refuse runs before the target is touched. Each function
 //! is planned and its original bytes are read first. Only then is an `mmap`
@@ -101,8 +103,9 @@ struct Hook {
 /// internal `_int_malloc` or `_int_memalign`, not the hooked `malloc`, so they
 /// are hooked on their own. Otherwise their blocks are never recorded, and a
 /// trap inside them would look like a safe point (PLAN 4.8, D54).
-/// `posix_memalign` and `malloc_trim` follow the same rule (R39). Both are
-/// required: glibc's static `malloc.o` defines them with every other entry.
+/// `posix_memalign` and `malloc_trim` follow the same rule (R39). An entry that
+/// an image lacks, or that the planner refuses, is skipped and reported, not
+/// required (D79).
 const HOOKS: [Hook; 10] = [
     Hook {
         symbol: "malloc",
@@ -173,15 +176,39 @@ pub struct Patch {
     pub original: [u8; JMP_LEN],
 }
 
+/// Why an allocator entry is not hooked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Skip {
+    /// The image has no function of this name in an executable section.
+    Absent,
+    /// The planner refused the entry point, which stays fail-closed (D29).
+    Refused(Refusal),
+}
+
+impl Skip {
+    /// The reason, in words, for the report. It completes the sentence "X is ...".
+    pub fn describe(self) -> String {
+        match self {
+            Skip::Absent => "not found as a function in an executable section".to_string(),
+            Skip::Refused(refusal) => format!("refused by the planner ({refusal:?})"),
+        }
+    }
+}
+
 /// The hooks as installed. `base` is the region, and `patches` lists every
-/// jump written into the target. `trampoline` is where an injected free starts,
-/// and `stop` is the `int3` that ends it. `internal` holds the `[start, end)`
-/// ranges of glibc's allocator internals (R37). It is `None` when the image is
-/// not a glibc build, so nothing is injected into it.
+/// jump written into the target. `hooked` names the entries that got a jump,
+/// and `skipped` names the others with the reason. `trampoline` is where an
+/// injected free starts, and `stop` is the `int3` that ends it. Both are 0, and
+/// `internal` is `None`, when `free` is not hooked, because nothing can then be
+/// injected. `internal` holds the `[start, end)` ranges of glibc's allocator
+/// internals (R37). It is `None` when the image is not a glibc build, so nothing
+/// is injected into it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Installed {
     pub base: u64,
     pub patches: Vec<Patch>,
+    pub hooked: Vec<&'static str>,
+    pub skipped: Vec<(&'static str, Skip)>,
     pub trampoline: u64,
     pub stop: u64,
     pub internal: Option<Vec<(u64, u64)>>,
@@ -207,10 +234,9 @@ pub enum InstallError {
     LibraryChanged(&'static str),
     /// No gap of the hook region's length lies within reach of the C library.
     NoRegion,
-    /// No function symbol with this name lies in an executable section.
-    MissingSymbol(&'static str),
-    /// The planner refused an entry point, which stays fail-closed (D29).
-    Refused(Refusal),
+    /// No allocator entry can be hooked: each one is absent from the image or
+    /// was refused by the planner. The list gives every reason. Nothing is written.
+    NoEntries(Vec<(&'static str, Skip)>),
     /// The region was not mapped at the hint. The value is what `mmap` returned.
     MmapFailed(i64),
     /// A wait returned a stop that the injection does not expect.
@@ -228,12 +254,6 @@ impl From<io::Error> for InstallError {
 impl From<Errno> for InstallError {
     fn from(errno: Errno) -> Self {
         InstallError::Os(errno)
-    }
-}
-
-impl From<Refusal> for InstallError {
-    fn from(refusal: Refusal) -> Self {
-        InstallError::Refused(refusal)
     }
 }
 
@@ -289,18 +309,32 @@ fn install_core<T: Tracer>(
         .collect();
 
     let mut planned = Vec::with_capacity(HOOKS.len());
+    let mut skipped = Vec::new();
+    let mut free = None;
     for hook in &HOOKS {
-        let (addr, function) = function_symbol(elf, bias, text, hook.symbol)
-            .ok_or(InstallError::MissingSymbol(hook.symbol))?;
+        let Some((addr, function)) = function_symbol(elf, bias, text, hook.symbol) else {
+            skipped.push((hook.symbol, Skip::Absent));
+            continue;
+        };
         let block = hint + hook.block;
-        let plan = hook::plan(addr, function, &refs, block, block + DISPLACED_OFFSET)?;
+        let plan = match hook::plan(addr, function, &refs, block, block + DISPLACED_OFFSET) {
+            Ok(plan) => plan,
+            Err(refusal) => {
+                skipped.push((hook.symbol, Skip::Refused(refusal)));
+                continue;
+            }
+        };
         let original = tracer.read_mem(pid, plan.patch_at, JMP_LEN)?;
         let original: [u8; JMP_LEN] = original.try_into().expect("read JMP_LEN bytes");
+        if hook.symbol == "free" {
+            free = Some(addr);
+        }
         planned.push((hook, plan, original));
     }
+    if planned.is_empty() {
+        return Err(InstallError::NoEntries(skipped));
+    }
 
-    let (free, _) = function_symbol(elf, bias, text, "free")
-        .expect("the planning loop found free, which is a hook");
     burn_exec_step(tracer, pid, pending_signals)?;
     let mapped = run_syscall(
         tracer,
@@ -327,12 +361,19 @@ fn install_core<T: Tracer>(
         hint + EXIT_OFFSET,
         &pad_to(exit_code(hint), INJECT_OFFSET - EXIT_OFFSET),
     )?;
-    let inject = inject_code(free, hint + INJECT_OFFSET);
-    let stop = hint + INJECT_OFFSET + inject.len() as u64 - 1;
-    tracer.write_mem(pid, hint + INJECT_OFFSET, &pad_to(inject, INJECT_LEN))?;
+    let (trampoline, stop) = match free {
+        Some(free) => {
+            let inject = inject_code(free, hint + INJECT_OFFSET);
+            let stop = hint + INJECT_OFFSET + inject.len() as u64 - 1;
+            tracer.write_mem(pid, hint + INJECT_OFFSET, &pad_to(inject, INJECT_LEN))?;
+            (hint + INJECT_OFFSET, stop)
+        }
+        None => (0, 0),
+    };
 
     let mut patches = Vec::with_capacity(planned.len());
-    for (_, plan, original) in planned {
+    let mut hooked = Vec::with_capacity(planned.len());
+    for (hook, plan, original) in planned {
         if let Err(error) = tracer.write_mem(pid, plan.patch_at, &plan.jump) {
             restore(tracer, pid, &patches);
             return Err(error.into());
@@ -341,13 +382,16 @@ fn install_core<T: Tracer>(
             at: plan.patch_at,
             original,
         });
+        hooked.push(hook.symbol);
     }
     Ok(Installed {
         base: hint,
         patches,
-        trampoline: hint + INJECT_OFFSET,
+        hooked,
+        skipped,
+        trampoline,
         stop,
-        internal: allocator_internals(elf, bias),
+        internal: free.and_then(|_| allocator_internals(elf, bias)),
     })
 }
 

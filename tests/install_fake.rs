@@ -6,12 +6,12 @@ mod common;
 
 use goblin::elf::Elf;
 use goblin::elf::program_header::PT_LOAD;
-use goblin::elf::section_header::SHF_EXECINSTR;
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic};
 use leakgc::hook::{Refusal, jmp_rel32};
 use leakgc::install::{
-    DEFAULT_HINT, InstallError, Installed, install_hooks as install_hooks_with_signals,
-    install_hooks_at as install_hooks_at_with_signals, install_library_hooks, uninstall,
+    DEFAULT_HINT, INJECT_OFFSET, InstallError, Installed, Skip,
+    install_hooks as install_hooks_with_signals, install_hooks_at as install_hooks_at_with_signals,
+    install_library_hooks, uninstall,
 };
 use nix::sys::signal::Signal;
 use nix::sys::wait::WaitStatus;
@@ -50,21 +50,6 @@ fn header_with_segment(p_offset: u64, p_vaddr: u64) -> Vec<u8> {
     image
 }
 
-/// A copy of `image` with the first occurrence of the symbol name `from`
-/// replaced by `to`, which must be the same length.
-fn with_renamed_symbol(image: &[u8], from: &str, to: &str) -> Vec<u8> {
-    assert_eq!(from.len(), to.len());
-    let needle = format!("\0{from}\0");
-    let at = image
-        .windows(needle.len())
-        .position(|window| window == needle.as_bytes())
-        .expect("name present")
-        + 1;
-    let mut out = image.to_vec();
-    out[at..at + to.len()].copy_from_slice(to.as_bytes());
-    out
-}
-
 /// The address and size of `.text` in a library mapped at `base`.
 fn library_text(base: u64) -> u64 {
     base + text_section(library_image()).0
@@ -86,31 +71,6 @@ fn header_only(e_type: u16) -> Vec<u8> {
     header
 }
 
-/// A copy of `image` whose named section no longer has `SHF_EXECINSTR`.
-fn without_exec_flag(image: &[u8], name: &str) -> Vec<u8> {
-    let elf = Elf::parse(image).expect("test image parses");
-    let index = elf
-        .section_headers
-        .iter()
-        .position(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(name))
-        .expect("section present");
-    let flags_at = elf.header.e_shoff as usize + index * elf.header.e_shentsize as usize + 8;
-    let mut out = image.to_vec();
-    let flags = u64::from_le_bytes(out[flags_at..flags_at + 8].try_into().expect("8 bytes"));
-    let cleared = flags & !u64::from(SHF_EXECINSTR);
-    out[flags_at..flags_at + 8].copy_from_slice(&cleared.to_le_bytes());
-    out
-}
-
-fn function_symbol(image: &[u8], name: &str) -> u64 {
-    let elf = Elf::parse(image).expect("test image parses");
-    elf.syms
-        .iter()
-        .find(|sym| sym.is_function() && elf.strtab.get_at(sym.st_name) == Some(name))
-        .expect("symbol present")
-        .st_value
-}
-
 /// The address and size of `.text`.
 fn text_section(image: &[u8]) -> (u64, u64) {
     let elf = Elf::parse(image).expect("test image parses");
@@ -120,15 +80,6 @@ fn text_section(image: &[u8]) -> (u64, u64) {
         .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".text"))
         .expect(".text present");
     (sh.sh_addr, sh.sh_size)
-}
-
-/// Where the patch goes for `malloc`: after `endbr64` when it is present.
-fn patch_point(fake: &Fake, malloc: u64) -> u64 {
-    if fake.bytes(malloc, ENDBR64.len()) == ENDBR64 {
-        malloc + ENDBR64.len() as u64
-    } else {
-        malloc
-    }
 }
 
 fn text_instructions(fake: &Fake) -> Vec<Instruction> {
@@ -142,13 +93,36 @@ fn text_instructions(fake: &Fake) -> Vec<Instruction> {
     out
 }
 
-fn refusal(result: Result<Installed, InstallError>) -> Refusal {
+/// The skip that `installed` records for `symbol`.
+fn skip_of(installed: &Installed, symbol: &str) -> Skip {
+    installed
+        .skipped
+        .iter()
+        .find(|(name, _)| *name == symbol)
+        .map(|(_, skip)| *skip)
+        .unwrap_or_else(|| panic!("{symbol} is hooked, not skipped"))
+}
+
+/// The skips of an install that hooked no entry at all.
+/// The skips that are refusals. An absent entry is not one: musl has no
+/// `pvalloc` or `malloc_trim`, so an image may lack entries on some libcs.
+fn refusals(skipped: &[(&str, Skip)]) -> Vec<Skip> {
+    skipped
+        .iter()
+        .filter(|(_, skip)| *skip != Skip::Absent)
+        .map(|(_, skip)| *skip)
+        .collect()
+}
+
+fn no_entries(result: Result<Installed, InstallError>) -> Vec<(&'static str, Skip)> {
     match result {
-        Err(InstallError::Refused(refusal)) => refusal,
-        other => panic!("expected a refusal, got {other:?}"),
+        Err(InstallError::NoEntries(skipped)) => skipped,
+        other => panic!("expected no entries, got {other:?}"),
     }
 }
 
+/// glibc only: the test expects every entry, and musl lacks `pvalloc` and `malloc_trim`.
+#[cfg(target_env = "gnu")]
 #[test]
 fn installs_the_jumps_last_in_hook_order() {
     let image = static_image();
@@ -231,6 +205,7 @@ fn the_trampoline_saves_calls_free_restores_and_stops_at_an_int3() {
     assert_eq!(instructions[9].immediate32(), 0x4000, "releases the window");
 }
 
+#[cfg(target_env = "gnu")]
 #[test]
 fn the_allocator_internals_of_a_glibc_build_are_known_by_address() {
     let image = static_image();
@@ -256,6 +231,7 @@ fn the_allocator_internals_of_a_glibc_build_are_known_by_address() {
     assert!(internal.contains(&range("free")), "free is guarded");
 }
 
+#[cfg(target_env = "gnu")]
 #[test]
 fn an_image_without_int_malloc_has_no_internal_ranges() {
     let elf = Elf::parse(static_image()).expect("test image parses");
@@ -591,9 +567,17 @@ fn a_hint_beyond_rel32_reach_is_refused_before_anything_is_written() {
     let image = static_image();
     let mut fake = Fake::new(image, vec![]);
 
-    let result = install_hooks_at(&mut fake, pid(), 1 << 40);
+    let skipped = no_entries(install_hooks_at(&mut fake, pid(), 1 << 40));
 
-    assert_eq!(refusal(result), Refusal::OutOfReach);
+    assert!(!skipped.is_empty());
+    let refused = refusals(&skipped);
+    assert!(!refused.is_empty(), "got {skipped:?}");
+    assert!(
+        refused
+            .iter()
+            .all(|skip| *skip == Skip::Refused(Refusal::OutOfReach)),
+        "got {skipped:?}"
+    );
     assert!(fake.writes.is_empty());
 }
 
@@ -601,39 +585,49 @@ fn a_hint_beyond_rel32_reach_is_refused_before_anything_is_written() {
 fn a_call_in_the_patch_is_refused() {
     let image = static_image();
     let malloc = function_symbol(image, "malloc");
-    let mut fake = Fake::new(image, vec![]);
+    let mut fake = Fake::new(image, vec![trap(), seccomp(), trap()]);
     let patch = patch_point(&fake, malloc);
     fake.poke(patch, &[0xe8, 0x00, 0x00, 0x00, 0x00]);
 
+    let installed = install_hooks(&mut fake, pid()).expect("installs the other entries");
+
     assert_eq!(
-        refusal(install_hooks(&mut fake, pid())),
-        Refusal::CallInPatch { at: patch }
+        skip_of(&installed, "malloc"),
+        Skip::Refused(Refusal::CallInPatch { at: patch })
     );
 }
 
 #[test]
-fn an_undecodable_instruction_elsewhere_in_text_is_refused() {
+fn an_undecodable_instruction_elsewhere_in_text_refuses_every_entry() {
     let image = static_image();
-    let (text, _) = text_section(image);
+    let (text, size) = text_section(image);
     let mut fake = Fake::new(image, vec![]);
     let at = text_instructions(&fake)
         .iter()
         .map(Instruction::ip)
-        .find(|ip| *ip >= text + 0x20000)
-        .expect("an instruction past 0x20000 into .text");
+        .find(|ip| *ip >= text + size / 2)
+        .expect("an instruction in the second half of .text");
     fake.poke(at, &[0x06]);
 
-    assert_eq!(
-        refusal(install_hooks(&mut fake, pid())),
-        Refusal::Undecodable { at }
+    let skipped = no_entries(install_hooks(&mut fake, pid()));
+
+    assert!(!skipped.is_empty());
+    let refused = refusals(&skipped);
+    assert!(!refused.is_empty(), "got {skipped:?}");
+    assert!(
+        refused
+            .iter()
+            .all(|skip| *skip == Skip::Refused(Refusal::Undecodable { at })),
+        "got {skipped:?}"
     );
+    assert!(fake.writes.is_empty());
 }
 
 #[test]
 fn a_branch_from_elsewhere_into_the_patch_is_refused() {
     let image = static_image();
     let malloc = function_symbol(image, "malloc");
-    let mut fake = Fake::new(image, vec![]);
+    let mut fake = Fake::new(image, vec![trap(), seccomp(), trap()]);
     let patch = patch_point(&fake, malloc);
     let site = text_instructions(&fake)
         .into_iter()
@@ -646,38 +640,38 @@ fn a_branch_from_elsewhere_into_the_patch_is_refused() {
     jmp.extend_from_slice(&rel.to_le_bytes());
     fake.poke(site.ip(), &jmp);
 
+    let installed = install_hooks(&mut fake, pid()).expect("installs the other entries");
+
     assert_eq!(
-        refusal(install_hooks(&mut fake, pid())),
-        Refusal::BranchIntoPatch {
+        skip_of(&installed, "malloc"),
+        Skip::Refused(Refusal::BranchIntoPatch {
             at: site.ip(),
             target: patch + 1,
-        }
+        })
     );
 }
 
 #[test]
-fn a_header_without_malloc_is_refused() {
+fn a_header_without_any_allocator_entry_is_refused() {
     let mut fake = Fake::new(&header_only(2), vec![]);
 
-    let result = install_hooks(&mut fake, pid());
+    let skipped = no_entries(install_hooks(&mut fake, pid()));
 
-    assert!(
-        matches!(result, Err(InstallError::MissingSymbol("malloc"))),
-        "got {result:?}"
-    );
+    assert_eq!(skipped.len(), 10, "every entry is listed");
+    assert!(skipped.iter().all(|(_, skip)| *skip == Skip::Absent));
+    assert!(fake.writes.is_empty());
 }
 
 #[test]
-fn a_malloc_outside_every_executable_section_is_refused() {
+fn allocator_entries_outside_every_executable_section_are_absent() {
     let image = without_exec_flag(static_image(), ".text");
     let mut fake = Fake::new(&image, vec![]);
 
-    let result = install_hooks(&mut fake, pid());
+    let skipped = no_entries(install_hooks(&mut fake, pid()));
 
-    assert!(
-        matches!(result, Err(InstallError::MissingSymbol("malloc"))),
-        "got {result:?}"
-    );
+    assert!(!skipped.is_empty());
+    assert!(skipped.iter().all(|(_, skip)| *skip == Skip::Absent));
+    assert!(fake.writes.is_empty());
 }
 
 #[test]
@@ -942,8 +936,8 @@ fn a_library_whose_base_would_lie_below_address_zero_is_refused() {
 }
 
 #[test]
-fn a_stripped_library_missing_a_hooked_name_is_refused() {
-    let mut fake = dynamic_fake(vec![]);
+fn a_stripped_library_without_realloc_still_hooks_the_other_entries() {
+    let mut fake = dynamic_fake(vec![trap(), seccomp(), trap()]);
     let image = with_renamed_symbol(stripped_library_image(), "realloc", "xealloc");
     map_library(
         &mut fake,
@@ -954,13 +948,62 @@ fn a_stripped_library_missing_a_hooked_name_is_refused() {
         "r-xp",
     );
 
-    let result = install_library(&mut fake);
+    let installed = install_library(&mut fake)
+        .expect("installs")
+        .expect("the library is mapped");
+
+    assert_eq!(installed.skipped, [("realloc", Skip::Absent)]);
+    assert_eq!(installed.patches.len(), 9);
+    assert!(!installed.hooked.contains(&"realloc"));
+}
+
+#[test]
+fn an_image_without_free_is_installed_without_an_injection_trampoline() {
+    let image = without_function_name(static_image(), "free");
+    let mut fake = Fake::new(&image, vec![trap(), seccomp(), trap()]);
+
+    let installed = install_hooks(&mut fake, pid()).expect("installs the other entries");
 
     assert!(
-        matches!(result, Err(InstallError::MissingSymbol("realloc"))),
-        "got {result:?}"
+        installed.skipped.contains(&("free", Skip::Absent)),
+        "got {:?}",
+        installed.skipped
     );
-    assert!(fake.writes.is_empty());
+    assert!(
+        installed
+            .skipped
+            .iter()
+            .all(|(_, skip)| *skip == Skip::Absent),
+        "got {:?}",
+        installed.skipped
+    );
+    assert!(!installed.hooked.contains(&"free"));
+    assert_eq!((installed.trampoline, installed.stop), (0, 0));
+    assert_eq!(installed.internal, None);
+    assert!(
+        fake.writes
+            .iter()
+            .all(|(addr, _)| *addr != DEFAULT_HINT + INJECT_OFFSET),
+        "no trampoline is written"
+    );
+}
+
+#[test]
+fn a_refused_free_leaves_no_injection_trampoline() {
+    let image = static_image();
+    let free = function_symbol(image, "free");
+    let mut fake = Fake::new(image, vec![trap(), seccomp(), trap()]);
+    let patch = patch_point(&fake, free);
+    fake.poke(patch, &[0xe8, 0x00, 0x00, 0x00, 0x00]);
+
+    let installed = install_hooks(&mut fake, pid()).expect("installs the other entries");
+
+    assert_eq!(
+        skip_of(&installed, "free"),
+        Skip::Refused(Refusal::CallInPatch { at: patch })
+    );
+    assert_eq!((installed.trampoline, installed.stop), (0, 0));
+    assert_eq!(installed.internal, None);
 }
 
 #[test]

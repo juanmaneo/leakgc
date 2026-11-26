@@ -21,7 +21,7 @@ use nix::unistd::Pid;
 use crate::crash::{self, Crash, Snapshot, Symbols};
 use crate::inject::{may_inject, xsave_available};
 use crate::install::{
-    HEAD_OFFSET, InstallError, Installed, RECORDS_OFFSET, REGION_LEN, install_hooks,
+    HEAD_OFFSET, InstallError, Installed, RECORDS_OFFSET, REGION_LEN, Skip, install_hooks,
     install_library_hooks, uninstall,
 };
 use crate::ledger::{ImageReport, Ledger, Reachability, released};
@@ -54,6 +54,12 @@ const DIRECTION_FLAG: u64 = 0x400;
 /// The note for a hooked image whose allocator internals are not named, so no
 /// block is freed by injection.
 const NO_INTERNALS: &str = "the allocator's internal functions have no symbol table entries, so no block is freed by injection";
+/// The note for a hooked image whose `free` is not hooked, so nothing can be freed by injection.
+const NO_FREE: &str = "free is not hooked, so no block is freed by injection";
+/// The entries whose calls change which blocks are live. Without both, a block
+/// freed or moved through an unhooked entry would still look live, and an
+/// injected free of it later would be a double free.
+const FREE_SIDE: [&str; 2] = ["free", "realloc"];
 
 /// Where an injected `free` starts from. `saved` is the state the process
 /// stopped in, and the last injected call restores it. The calls run below
@@ -306,14 +312,60 @@ impl Process {
 
     /// Records a fresh installation of hooks and the notes that go with it.
     fn hooked(&mut self, hook: Installed, after_library: bool) {
-        self.notes.push("hooked malloc, free, realloc, calloc, memalign, aligned_alloc, valloc, pvalloc, posix_memalign and malloc_trim; allocations after the last trapped call are not read (D34)".to_string());
+        self.notes.push(format!(
+            "hooked {}; allocations after the last trapped call are not read (D34)",
+            hook.hooked.join(", ")
+        ));
+        self.skip_notes(&hook.skipped);
+        let frees: Vec<&str> = hook
+            .skipped
+            .iter()
+            .map(|(symbol, _)| *symbol)
+            .filter(|symbol| FREE_SIDE.contains(symbol))
+            .collect();
+        if !frees.is_empty() {
+            let reason = self.untrusted.get_or_insert(format!(
+                "{} not hooked, so the program's frees are not seen",
+                frees.join(" and ")
+            ));
+            self.reach = Reachability::Incomplete(reason.clone());
+        }
         if after_library {
             self.notes.push("hooks were installed after the C library was mapped: allocations before that are not recorded".to_string());
         }
         if hook.internal.is_none() {
-            self.notes.push(NO_INTERNALS.to_string());
+            let note = if hook.hooked.contains(&"free") {
+                NO_INTERNALS
+            } else {
+                NO_FREE
+            };
+            self.notes.push(note.to_string());
         }
         self.hook = Some(hook);
+    }
+
+    /// Names each entry that was not hooked, with the reason, so the report says
+    /// why its calls are missing (D79).
+    fn skip_notes(&mut self, skipped: &[(&str, Skip)]) {
+        for (symbol, skip) in skipped {
+            self.notes.push(format!(
+                "not hooked: {symbol} is {}, so its calls are not recorded",
+                skip.describe()
+            ));
+        }
+    }
+
+    /// Records why no hooks were installed. Each refused or absent entry is named
+    /// with its reason.
+    fn no_hooks(&mut self, error: InstallError) {
+        match error {
+            InstallError::NoEntries(skipped) => {
+                self.notes
+                    .push("not covered: no allocator entry can be hooked".to_string());
+                self.skip_notes(&skipped);
+            }
+            error => self.notes.push(format!("not covered: {error:?}")),
+        }
     }
 
     /// Installs the hooks in the C library, if it is mapped at this exit. A
@@ -332,7 +384,7 @@ impl Process {
             }
             Err(error) => {
                 self.awaiting_library = false;
-                self.notes.push(format!("not covered: {error:?}"));
+                self.no_hooks(error);
             }
         }
     }
@@ -599,7 +651,7 @@ impl Monitor {
                     .notes
                     .push("hooks wait until the C library is mapped".to_string());
             }
-            Err(error) => process.notes.push(format!("not covered: {error:?}")),
+            Err(error) => process.no_hooks(error),
         }
         self.states.insert(pid, process);
         pending_signals

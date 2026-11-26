@@ -48,6 +48,15 @@ impl Hooked {
     }
 }
 
+/// The entries the static fixture hooks. musl has no `pvalloc` or `malloc_trim`.
+const STATIC_HOOKS: usize = if cfg!(target_env = "gnu") { 10 } else { 8 };
+
+/// The writes an install makes when `hooked` entries get a hook: the syscall bytes
+/// twice, the exit code and the trampoline once, then one block and one jump per hook.
+fn install_writes(hooked: usize) -> usize {
+    4 + 2 * hooked
+}
+
 /// A process checked at every trapped call, so most tests need no allocation count.
 fn hooked() -> Hooked {
     hooked_every(0)
@@ -60,8 +69,12 @@ fn hooked_every(collect_every: u64) -> Hooked {
     map_line(&mut fake, DEFAULT_HINT, DEFAULT_HINT + REGION_LEN, "rwxp");
     let mut monitor = Monitor::new(collect_every);
     assert!(monitor.exec(&mut fake, pid()).is_empty());
-    assert_eq!(fake.writes.len(), 24, "the install wrote every hook");
-    let jumps = fake.writes[14..]
+    assert_eq!(
+        fake.writes.len(),
+        install_writes(STATIC_HOOKS),
+        "the install wrote every hook"
+    );
+    let jumps = fake.writes[fake.writes.len() - STATIC_HOOKS..]
         .iter()
         .map(|(at, bytes)| (*at, bytes.clone()))
         .collect();
@@ -80,6 +93,16 @@ fn only(reports: Vec<ImageReport>) -> ImageReport {
 
 fn has_note(report: &ImageReport, prefix: &str) -> bool {
     report.notes.iter().any(|note| note.starts_with(prefix))
+}
+
+/// The notes except those about entries the libc does not have. Which entries
+/// a libc has differs between libcs, so counting every note would not travel.
+fn notes_but_skips(report: &ImageReport) -> Vec<&String> {
+    report
+        .notes
+        .iter()
+        .filter(|note| !note.starts_with("not hooked: "))
+        .collect()
 }
 
 #[test]
@@ -141,7 +164,7 @@ fn a_record_that_does_not_decode_stops_reading_and_drops_the_hooks() {
     h.monitor.trapped(&mut h.fake, pid(), Some(libc::SYS_clone));
 
     let report = only(h.monitor.finish());
-    assert_eq!(report.notes.len(), 3, "{:?}", report.notes);
+    assert_eq!(notes_but_skips(&report).len(), 3, "{:?}", report.notes);
     assert!(has_note(&report, "record 0 is corrupt"));
     assert_eq!(
         report.reachability,
@@ -334,7 +357,7 @@ fn a_clone_without_shared_memory_keeps_the_hooks() {
 
     assert!(h.jumps_in_place());
     let report = only(h.monitor.finish());
-    assert_eq!(report.notes.len(), 2, "{:?}", report.notes);
+    assert_eq!(notes_but_skips(&report).len(), 2, "{:?}", report.notes);
 }
 
 #[test]
@@ -709,6 +732,101 @@ fn an_image_that_is_not_hooked_is_never_checked() {
     assert_eq!(report.reachability, Reachability::Unchecked);
 }
 
+/// Maps the stack and the hook region, then execs the static process in `fake`.
+/// Any hooks land at `DEFAULT_HINT`, as in `hooked_every`.
+fn exec_static(fake: &mut Fake) -> Monitor {
+    map_writable(fake, STACK.0, STACK.1);
+    map_line(fake, DEFAULT_HINT, DEFAULT_HINT + REGION_LEN, "rwxp");
+    let mut monitor = Monitor::new(0);
+    assert!(monitor.exec(fake, pid()).is_empty());
+    monitor
+}
+
+#[test]
+fn a_static_image_without_free_says_its_frees_are_not_seen() {
+    let image = without_function_name(static_image(), "free");
+    let mut fake = Fake::new(&image, vec![trap(), seccomp(), trap()]);
+    let mut monitor = exec_static(&mut fake);
+
+    monitor.exited(pid(), "exit code 0".to_string());
+
+    let report = only(monitor.finish());
+    assert!(has_note(
+        &report,
+        "not hooked: free is not found as a function in an executable section, so its calls are not recorded"
+    ));
+    assert!(has_note(
+        &report,
+        "free is not hooked, so no block is freed by injection"
+    ));
+    assert_eq!(
+        report.reachability,
+        Reachability::Incomplete(
+            "free not hooked, so the program's frees are not seen".to_string()
+        )
+    );
+}
+
+#[test]
+fn a_library_without_realloc_says_its_frees_are_not_seen() {
+    let image = with_renamed_symbol(stripped_library_image(), "realloc", "xealloc");
+    let mut h = dynamic_hooked_with(&image, 9);
+
+    let report = only(h.monitor.finish());
+    assert!(has_note(
+        &report,
+        "not hooked: realloc is not found as a function in an executable section, so its calls are not recorded"
+    ));
+    assert_eq!(
+        report.reachability,
+        Reachability::Incomplete(
+            "realloc not hooked, so the program's frees are not seen".to_string()
+        )
+    );
+}
+
+#[test]
+fn an_image_with_no_executable_allocator_code_is_not_covered() {
+    let image = without_exec_flag(static_image(), ".text");
+    let mut fake = Fake::new(&image, vec![]);
+    let mut monitor = exec_static(&mut fake);
+
+    assert!(fake.writes.is_empty(), "nothing is written");
+    let report = only(monitor.finish());
+    assert!(has_note(
+        &report,
+        "not covered: no allocator entry can be hooked"
+    ));
+    let named = report
+        .notes
+        .iter()
+        .filter(|note| note.starts_with("not hooked: "))
+        .count();
+    assert_eq!(named, 10, "every entry is named: {:?}", report.notes);
+    assert_eq!(report.reachability, Reachability::Unchecked);
+}
+
+#[test]
+fn a_refused_malloc_is_named_and_the_ledger_stays_trusted() {
+    let image = static_image();
+    let malloc = function_symbol(image, "malloc");
+    let mut fake = Fake::new(image, vec![trap(), seccomp(), trap()]);
+    let patch = patch_point(&fake, malloc);
+    fake.poke(patch, &[0xe8, 0x00, 0x00, 0x00, 0x00]);
+    let mut monitor = exec_static(&mut fake);
+
+    set_head(&mut fake, 0);
+    monitor.trapped(&mut fake, pid(), None);
+
+    let report = only(monitor.finish());
+    assert!(has_note(
+        &report,
+        "not hooked: malloc is refused by the planner ("
+    ));
+    assert!(has_note(&report, "hooked free, realloc, calloc"));
+    assert_eq!(report.reachability, Reachability::Checked { lost: vec![] });
+}
+
 #[test]
 fn a_trap_inside_a_hooked_call_keeps_the_last_complete_check() {
     let mut h = hooked();
@@ -807,6 +925,11 @@ fn a_forked_child_inherits_a_check_of_the_memory_it_copies() {
 /// installed at the first trapped `mmap` exit after the mapping. The hook region
 /// lands at `DEFAULT_HINT`, so the record helpers apply.
 fn dynamic_hooked(image: &[u8]) -> Hooked {
+    dynamic_hooked_with(image, 10)
+}
+
+/// `dynamic_hooked` for an image in which `hooked` entries get a jump.
+fn dynamic_hooked_with(image: &[u8], hooked: usize) -> Hooked {
     let mut fake = dynamic_fake(vec![trap(), seccomp(), trap()]);
     map_writable(&mut fake, STACK.0, STACK.1);
     let mut monitor = Monitor::new(0);
@@ -822,8 +945,12 @@ fn dynamic_hooked(image: &[u8]) -> Hooked {
     assert!(monitor.trapped(&mut fake, pid(), Some(libc::SYS_mmap)));
     let pristine = fake.mem.clone();
     assert!(monitor.syscall_exited(&mut fake, pid()).is_empty());
-    assert_eq!(fake.writes.len(), 24, "the install wrote every hook");
-    let jumps = fake.writes[14..]
+    assert_eq!(
+        fake.writes.len(),
+        install_writes(hooked),
+        "the install wrote its hooks"
+    );
+    let jumps = fake.writes[fake.writes.len() - hooked..]
         .iter()
         .map(|(at, bytes)| (*at, bytes.clone()))
         .collect();

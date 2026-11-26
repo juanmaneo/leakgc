@@ -16,6 +16,21 @@ void *entries[] = {
 #endif
 };
 
+/* glibc's allocator keeps `_int_malloc` in the image, and the injection checks
+   look for it (R37). On other libcs this stand-in gives the fake tests the same
+   shape, so they reach the injection code everywhere. Nothing calls it. The
+   padding keeps the crash tests' offsets inside it. */
+#ifndef __GLIBC__
+__asm__(".globl _int_malloc\n"
+        ".type _int_malloc, @function\n"
+        "_int_malloc:\n"
+        ".rept 64\n"
+        "nop\n"
+        ".endr\n"
+        "ret\n"
+        ".size _int_malloc, .-_int_malloc\n");
+#endif
+
 int main(void) {
     keep[0] = malloc(16);
     keep[1] = malloc(100);
