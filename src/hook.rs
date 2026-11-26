@@ -7,8 +7,8 @@
 //! A refusal leaves that entry point fail-closed: its blocks are never freed.
 
 use iced_x86::{
-    BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, Instruction, InstructionBlock,
-    Mnemonic, OpKind,
+    BlockEncoder, BlockEncoderOptions, Code, Decoder, DecoderOptions, Instruction,
+    InstructionBlock, Mnemonic, OpKind,
 };
 
 /// Length of the `jmp rel32` written at the entry point.
@@ -25,10 +25,11 @@ pub enum Refusal {
     ShortPatch,
     /// A near branch lands inside the patched bytes (R19).
     BranchIntoPatch { at: u64, target: u64 },
-    /// A displaced instruction is a call. Its return address would point into
-    /// the trampoline, not into the original code.
+    /// A displaced instruction is an indirect call, whose target cannot be moved
+    /// into the trampoline without a register (D88).
     CallInPatch { at: u64 },
-    /// The displaced instructions cannot be re-encoded at their new address.
+    /// The displaced instructions cannot be re-encoded at their new address, or a
+    /// relocated call's return address does not fit a sign-extended 32-bit push.
     Relocation,
     /// The `jmp rel32` at the entry point cannot reach the trampoline.
     OutOfReach,
@@ -96,9 +97,10 @@ pub fn plan(
             break;
         }
         if ins.mnemonic() == Mnemonic::Call {
-            return Err(Refusal::CallInPatch { at: ins.ip() });
+            displaced.extend(relocate_call(ins)?);
+        } else {
+            displaced.push(*ins);
         }
-        displaced.push(*ins);
         patch_len += ins.len();
     }
     if patch_len < JMP_LEN {
@@ -124,6 +126,23 @@ pub fn plan(
         jump,
         displaced_code,
     })
+}
+
+/// Rewrites a displaced direct call as `push <return address>; jmp <target>`.
+/// The push stores the address the original call would have pushed, so the
+/// callee returns to the original code after the call, and its stack is the same
+/// as before. A direct call is five bytes, so it always completes the patch, and
+/// no displaced instruction follows it. An indirect call is refused (D88).
+fn relocate_call(call: &Instruction) -> Result<[Instruction; 2], Refusal> {
+    if call.code() != Code::Call_rel32_64 {
+        return Err(Refusal::CallInPatch { at: call.ip() });
+    }
+    let return_address = i32::try_from(call.next_ip()).map_err(|_| Refusal::Relocation)?;
+    let push = Instruction::with1(Code::Pushq_imm32, return_address)
+        .expect("push imm32 is a valid instruction");
+    let jump = Instruction::with_branch(Code::Jmp_rel32_64, call.near_branch_target())
+        .expect("jmp rel32 is a valid instruction");
+    Ok([push, jump])
 }
 
 /// Checks one executable section for near branches into the patch. A section

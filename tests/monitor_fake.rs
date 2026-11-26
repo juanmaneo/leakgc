@@ -812,7 +812,8 @@ fn a_refused_malloc_is_named_and_the_ledger_stays_trusted() {
     let malloc = function_symbol(image, "malloc");
     let mut fake = Fake::new(image, vec![trap(), seccomp(), trap()]);
     let patch = patch_point(&fake, malloc);
-    fake.poke(patch, &[0xe8, 0x00, 0x00, 0x00, 0x00]);
+    // An indirect call cannot be relocated, so the planner refuses malloc (D88).
+    fake.poke(patch, &[0xff, 0xd0, 0x90, 0x90, 0x90]);
     let mut monitor = exec_static(&mut fake);
 
     set_head(&mut fake, 0);

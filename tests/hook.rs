@@ -1,4 +1,4 @@
-use iced_x86::{Decoder, DecoderOptions};
+use iced_x86::{Code, Decoder, DecoderOptions};
 use leakgc::hook::{JMP_LEN, Plan, Refusal, jmp_rel32, plan};
 
 const ADDR: u64 = 0x1000;
@@ -147,12 +147,65 @@ fn branch_to_the_patch_start_is_allowed() {
 }
 
 #[test]
-fn call_in_the_patch_is_refused() {
-    // call +0; ret
+fn indirect_call_in_the_patch_is_refused() {
+    // call rax; nop; nop; nop; ret
     assert_eq!(
-        plan_alone(ADDR, &[0xe8, 0x00, 0x00, 0x00, 0x00, 0xc3]),
+        plan_alone(ADDR, &[0xff, 0xd0, 0x90, 0x90, 0x90, 0xc3]),
         Err(Refusal::CallInPatch { at: ADDR })
     );
+}
+
+#[test]
+fn direct_call_in_the_patch_becomes_push_and_jump() {
+    // call +0x10 (target 0x1015); ret. The return address is 0x1005.
+    let p = plan_alone(ADDR, &[0xe8, 0x10, 0x00, 0x00, 0x00, 0xc3]).unwrap();
+    assert_eq!(p.patch_len, JMP_LEN);
+
+    let mut dec = Decoder::with_ip(64, &p.displaced_code, DISPLACED, DecoderOptions::NONE);
+    let push = dec.decode();
+    assert_eq!(push.code(), Code::Pushq_imm32);
+    assert_eq!(push.immediate32(), (ADDR + 5) as u32);
+    let jump = dec.decode();
+    assert_eq!(jump.code(), Code::Jmp_rel32_64);
+    assert_eq!(jump.near_branch_target(), ADDR + 0x15);
+    assert!(!dec.can_decode());
+}
+
+#[test]
+fn relocated_call_whose_return_address_needs_more_than_31_bits_is_refused() {
+    // call +0 at 0x7fff_fffb. Its return address 0x8000_0000 does not fit a sign-extended push imm32.
+    assert_eq!(
+        plan(
+            0x7fff_fffb,
+            &[0xe8, 0x00, 0x00, 0x00, 0x00, 0xc3],
+            &[],
+            ENTRY,
+            DISPLACED
+        ),
+        Err(Refusal::Relocation)
+    );
+}
+
+#[test]
+fn relocated_call_to_a_far_target_jumps_through_an_absolute_address() {
+    // call +0x1800_0000 at 0x7000_0000 targets 0x8800_0005, which a rel32 jump at
+    // 0x2100 cannot reach. The encoder emits `jmp [rip+x]` to an 8-byte address.
+    let p = plan(
+        0x7000_0000,
+        &[0xe8, 0x00, 0x00, 0x00, 0x18, 0xc3],
+        &[],
+        ENTRY,
+        DISPLACED,
+    )
+    .unwrap();
+
+    let mut dec = Decoder::with_ip(64, &p.displaced_code, DISPLACED, DecoderOptions::NONE);
+    assert_eq!(dec.decode().code(), Code::Pushq_imm32);
+    let jump = dec.decode();
+    assert_eq!(jump.code(), Code::Jmp_rm64);
+    let slot = (jump.ip_rel_memory_address() - DISPLACED) as usize;
+    let target: [u8; 8] = p.displaced_code[slot..slot + 8].try_into().unwrap();
+    assert_eq!(u64::from_le_bytes(target), 0x8800_0005);
 }
 
 #[test]

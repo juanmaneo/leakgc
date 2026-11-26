@@ -584,12 +584,12 @@ fn a_hint_beyond_rel32_reach_is_refused_before_anything_is_written() {
 }
 
 #[test]
-fn a_call_in_the_patch_is_refused() {
+fn an_indirect_call_in_the_patch_is_refused() {
     let image = static_image();
     let malloc = function_symbol(image, "malloc");
     let mut fake = Fake::new(image, vec![trap(), seccomp(), trap()]);
     let patch = patch_point(&fake, malloc);
-    fake.poke(patch, &[0xe8, 0x00, 0x00, 0x00, 0x00]);
+    fake.poke(patch, &[0xff, 0xd0, 0x90, 0x90, 0x90]);
 
     let installed = install_hooks(&mut fake, pid()).expect("installs the other entries");
 
@@ -999,7 +999,7 @@ fn a_refused_free_leaves_no_injection_trampoline() {
     let free = function_symbol(image, "free");
     let mut fake = Fake::new(image, vec![trap(), seccomp(), trap()]);
     let patch = patch_point(&fake, free);
-    fake.poke(patch, &[0xe8, 0x00, 0x00, 0x00, 0x00]);
+    fake.poke(patch, &[0xff, 0xd0, 0x90, 0x90, 0x90]);
 
     let installed = install_hooks(&mut fake, pid()).expect("installs the other entries");
 
