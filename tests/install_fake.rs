@@ -755,6 +755,25 @@ fn a_stripped_library_is_hooked_without_internal_ranges() {
 }
 
 #[test]
+fn a_musl_loader_is_hooked_by_its_file_name() {
+    let mut fake = dynamic_fake(vec![trap(), seccomp(), trap()]);
+    map_library(
+        &mut fake,
+        library_image(),
+        LIBRARY_BASE,
+        LIBRARY_INODE,
+        "/lib/ld-musl-x86_64.so.1",
+        "r-xp",
+    );
+
+    let installed = install_library(&mut fake)
+        .expect("installs")
+        .expect("the library is mapped");
+
+    assert_eq!(installed.patches.len(), 10);
+}
+
+#[test]
 fn a_library_without_an_executable_mapping_is_not_hooked_yet() {
     let mut fake = dynamic_fake(vec![]);
     map_library(

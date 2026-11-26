@@ -72,8 +72,11 @@ const MAX_SECCOMP_STOPS: usize = 4;
 const ASM: &str = "trampoline instruction assembles";
 const ASM_NEW: &str = "64-bit assembler is available";
 const LAYOUT: &str = "block code fits its slot";
-/// The shared C library whose allocator entries a dynamic process gets hooked.
-const C_LIBRARY: &str = "libc.so.6";
+/// The shared C libraries whose allocator entries a dynamic process gets hooked,
+/// matched by the file name the kernel maps. glibc maps `libc.so.6`. musl maps its
+/// loader, `ld-musl-x86_64.so.1`, which is also `libc.so`. The soname musl
+/// records is `libc.musl-x86_64.so.1`, so a file under that name is matched too.
+const C_LIBRARIES: [&str; 3] = ["libc.so.6", "libc.musl-x86_64.so.1", "ld-musl-x86_64.so.1"];
 /// How far a `jmp rel32` reaches, less a margin. The hook region is placed within
 /// this distance of every mapping of the library (D55).
 const REL32_REACH: u64 = 0x7000_0000;
@@ -362,7 +365,10 @@ pub fn install_library_hooks<T: Tracer>(
     pending_signals: &mut Vec<Signal>,
 ) -> Result<Option<Installed>, InstallError> {
     let map = tracer.read_maps(pid)?;
-    let Some(library) = maps::library(&map, C_LIBRARY) else {
+    let Some(library) = C_LIBRARIES
+        .into_iter()
+        .find_map(|name| maps::library(&map, name))
+    else {
         return Ok(None);
     };
     if !library.executable {
