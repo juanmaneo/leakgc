@@ -2,7 +2,7 @@
 //!
 //! A block is outstanding from the call that returned it until a call frees it.
 //! Reachability is not decided here. The monitor runs a scan and records its
-//! result in [`ImageReport`] (P4b, report only).
+//! result in [`ImageReport`] (P4b).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -125,8 +125,8 @@ impl Ledger {
     }
 }
 
-/// What the last reachability check found (P4b). The check is report only:
-/// nothing is freed.
+/// What the last reachability check found (P4b). The check frees nothing:
+/// the monitor frees a block only after two checks confirm it (P5).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Reachability {
     /// No check has completed for this image.
@@ -200,12 +200,12 @@ impl ImageReport {
                 let lost_blocks: u64 = lost.iter().map(|site| site.blocks).sum();
                 let lost_bytes: u64 = lost.iter().map(|site| site.bytes).sum();
                 format!(
-                    "{}: {outstanding}; {lost_blocks} blocks, {lost_bytes} bytes unreachable at the last check (P4, report only)",
+                    "{}: {outstanding}; {lost_blocks} blocks, {lost_bytes} bytes unreachable at the last check",
                     self.label
                 )
             }
             Reachability::Unchecked | Reachability::Incomplete(_) => format!(
-                "{}: {outstanding} (not checked for reachability, P4)",
+                "{}: {outstanding} (not checked for reachability)",
                 self.label
             ),
         }

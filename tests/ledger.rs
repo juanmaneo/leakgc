@@ -263,7 +263,7 @@ fn a_report_lists_its_totals_notes_sites_and_unknown_frees() {
     assert_eq!(
         report.lines(),
         vec![
-            "image 1 (pid 100): 3 blocks, 56 bytes outstanding (not checked for reachability, P4)",
+            "image 1 (pid 100): 3 blocks, 56 bytes outstanding (not checked for reachability)",
             "  note: hooked",
             "  caller 0xa: 2 blocks, 48 bytes",
             "  caller 0xb: 1 blocks, 8 bytes",
@@ -278,7 +278,7 @@ fn an_empty_report_has_only_its_header() {
 
     assert_eq!(
         report.lines(),
-        vec!["image 2 (pid 7): 0 blocks, 0 bytes outstanding (not checked for reachability, P4)"]
+        vec!["image 2 (pid 7): 0 blocks, 0 bytes outstanding (not checked for reachability)"]
     );
 }
 
@@ -326,7 +326,7 @@ fn a_checked_report_says_what_nothing_reaches() {
     assert_eq!(
         report.lines(),
         vec![
-            "image 1 (pid 100): 2 blocks, 24 bytes outstanding; 1 blocks, 8 bytes unreachable at the last check (P4, report only)",
+            "image 1 (pid 100): 2 blocks, 24 bytes outstanding; 1 blocks, 8 bytes unreachable at the last check",
             "  note: hooked",
             "  unreachable caller 0xb: 1 blocks, 8 bytes",
             "  caller 0xa: 1 blocks, 16 bytes",
@@ -345,7 +345,7 @@ fn a_checked_report_with_nothing_unreachable_says_so() {
     assert_eq!(
         report.lines(),
         vec![
-            "image 1 (pid 100): 1 blocks, 16 bytes outstanding; 0 blocks, 0 bytes unreachable at the last check (P4, report only)",
+            "image 1 (pid 100): 1 blocks, 16 bytes outstanding; 0 blocks, 0 bytes unreachable at the last check",
             "  caller 0xa: 1 blocks, 16 bytes",
         ]
     );
@@ -361,7 +361,7 @@ fn a_report_whose_check_failed_claims_nothing_and_gives_the_reason() {
     assert_eq!(
         report.lines(),
         vec![
-            "image 1 (pid 100): 1 blocks, 16 bytes outstanding (not checked for reachability, P4)",
+            "image 1 (pid 100): 1 blocks, 16 bytes outstanding (not checked for reachability)",
             "  reachability not checked: the memory map cannot be parsed",
             "  caller 0xa: 1 blocks, 16 bytes",
         ]

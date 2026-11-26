@@ -19,7 +19,8 @@ pub use sweep::{LeakReport, SiteLoss};
 pub type BlockId = u64;
 
 /// Whether collections free the blocks they find unreachable. Report is the
-/// default (D4): nothing is freed unless the caller opts in with `Free`.
+/// default of this model (D4). The product frees by default (D40), and it does
+/// not use this enum.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Pacing collections report lost blocks and keep them.
