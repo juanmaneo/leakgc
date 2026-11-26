@@ -177,6 +177,10 @@ impl Tracer for Fake {
         unreachable!("install never resumes the tracee")
     }
 
+    fn syscall(&mut self, _pid: Pid) -> nix::Result<()> {
+        unreachable!("install never resumes a trapped call")
+    }
+
     fn send_signal(&mut self, _pid: Pid, _sig: Signal) -> nix::Result<()> {
         unreachable!("install never signals")
     }

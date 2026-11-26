@@ -47,6 +47,10 @@ impl Tracer for RefuseSeize {
         self.os.cont(pid, sig)
     }
 
+    fn syscall(&mut self, pid: Pid) -> nix::Result<()> {
+        self.os.syscall(pid)
+    }
+
     fn send_signal(&mut self, pid: Pid, sig: Signal) -> nix::Result<()> {
         self.os.send_signal(pid, sig)
     }

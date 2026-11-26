@@ -40,6 +40,8 @@ pub enum Event {
     /// A `vfork` or `clone`. The new task is named by `event_message`.
     Spawn(Pid),
     PtraceStop(Pid),
+    /// A trapped call returned. Only calls resumed with [`Tracer::syscall`] stop here.
+    SyscallExit(Pid),
     SignalStop(Pid, Signal),
     Ignored,
 }
@@ -54,9 +56,8 @@ pub fn classify(status: WaitStatus) -> Event {
         WaitStatus::PtraceEvent(pid, _, libc::PTRACE_EVENT_VFORK | libc::PTRACE_EVENT_CLONE) => {
             Event::Spawn(pid)
         }
-        WaitStatus::PtraceEvent(pid, _, _) | WaitStatus::PtraceSyscall(pid) => {
-            Event::PtraceStop(pid)
-        }
+        WaitStatus::PtraceEvent(pid, _, _) => Event::PtraceStop(pid),
+        WaitStatus::PtraceSyscall(pid) => Event::SyscallExit(pid),
         WaitStatus::Stopped(pid, signal) => Event::SignalStop(pid, signal),
         WaitStatus::Continued(_) | WaitStatus::StillAlive => Event::Ignored,
     }
@@ -73,6 +74,9 @@ pub trait Tracer {
     fn wait_any(&mut self) -> nix::Result<WaitStatus>;
     fn seize(&mut self, pid: Pid) -> nix::Result<()>;
     fn cont(&mut self, pid: Pid, sig: Option<Signal>) -> nix::Result<()>;
+    /// Resumes a tracee stopped at a trapped call, so that it stops again when
+    /// the call returns.
+    fn syscall(&mut self, pid: Pid) -> nix::Result<()>;
     fn send_signal(&mut self, pid: Pid, sig: Signal) -> nix::Result<()>;
     fn syscall_nr(&mut self, pid: Pid) -> nix::Result<i64>;
     fn read_maps(&mut self, pid: Pid) -> io::Result<String>;
@@ -123,12 +127,17 @@ impl Tracer for OsTracer {
             | Options::PTRACE_O_TRACECLONE
             | Options::PTRACE_O_TRACEFORK
             | Options::PTRACE_O_TRACEVFORK
+            | Options::PTRACE_O_TRACESYSGOOD
             | Options::PTRACE_O_EXITKILL;
         ptrace::seize(pid, options)
     }
 
     fn cont(&mut self, pid: Pid, sig: Option<Signal>) -> nix::Result<()> {
         ptrace::cont(pid, sig)
+    }
+
+    fn syscall(&mut self, pid: Pid) -> nix::Result<()> {
+        ptrace::syscall(pid, None)
     }
 
     fn send_signal(&mut self, pid: Pid, sig: Signal) -> nix::Result<()> {
@@ -319,6 +328,9 @@ impl<T: Tracer> Session<'_, '_, T> {
                     );
                 }
                 self.monitor.trapped(&mut *self.tracer, pid, nr.ok());
+                let _ = self.tracer.syscall(pid);
+            }
+            Event::SyscallExit(pid) => {
                 let _ = self.tracer.cont(pid, None);
             }
             Event::Exec(pid) => {

@@ -31,6 +31,7 @@ enum Call {
     WaitAny,
     Seize(i32),
     Cont(i32, Option<Signal>),
+    Syscall(i32),
     Kill(i32, Signal),
     SyscallNr(i32),
     ReadMaps(i32),
@@ -112,6 +113,11 @@ impl Tracer for Fake {
 
     fn cont(&mut self, pid: Pid, sig: Option<Signal>) -> nix::Result<()> {
         self.calls.push(Call::Cont(pid.as_raw(), sig));
+        self.cont_result
+    }
+
+    fn syscall(&mut self, pid: Pid) -> nix::Result<()> {
+        self.calls.push(Call::Syscall(pid.as_raw()));
         self.cont_result
     }
 
@@ -219,6 +225,10 @@ fn exec_event(pid: i32) -> Scripted {
     ))
 }
 
+fn syscall_exit(pid: i32) -> Scripted {
+    Ok(WaitStatus::PtraceSyscall(Pid::from_raw(pid)))
+}
+
 fn run(tracer: &mut Fake, with_log: bool) -> (i32, String) {
     let args = [OsString::from("game.exe")];
     let mut buf = Vec::new();
@@ -256,7 +266,7 @@ fn happy_path_resumes_every_stop_and_returns_the_root_exit_code() {
             Call::Kill(STUB, Signal::SIGCONT),
             Call::WaitAny,
             Call::SyscallNr(STUB),
-            Call::Cont(STUB, None),
+            Call::Syscall(STUB),
             Call::WaitAny,
             Call::Cont(STUB, None),
             Call::WaitAny,
@@ -327,6 +337,31 @@ fn a_signal_seen_during_install_is_requeued_before_the_exec_resumes() {
             .calls
             .contains(&Call::Cont(STUB, Some(Signal::SIGSTOP)))
     );
+}
+
+#[test]
+fn a_trapped_call_is_resumed_to_its_exit_and_then_continued() {
+    let mut tracer = Fake::new(
+        vec![stopped(STUB, Signal::SIGSTOP)],
+        vec![
+            exec_event(STUB),
+            trap(STUB),
+            syscall_exit(STUB),
+            exited(STUB, 0),
+        ],
+    );
+    tracer.syscall_result = Ok(libc::SYS_mmap);
+
+    let (code, _) = run(&mut tracer, false);
+
+    assert_eq!(code, 0);
+    let trapped = tracer
+        .calls
+        .iter()
+        .position(|call| *call == Call::Syscall(STUB))
+        .expect("the trapped call is resumed to its exit");
+    assert_eq!(tracer.calls[trapped + 1], Call::WaitAny);
+    assert_eq!(tracer.calls[trapped + 2], Call::Cont(STUB, None));
 }
 
 #[test]
@@ -646,7 +681,7 @@ fn classify_maps_every_wait_status() {
     }
     assert_eq!(
         classify(WaitStatus::PtraceSyscall(pid)),
-        Event::PtraceStop(pid)
+        Event::SyscallExit(pid)
     );
     assert_eq!(
         classify(WaitStatus::Stopped(pid, Signal::SIGCHLD)),
