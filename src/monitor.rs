@@ -127,7 +127,14 @@ impl Process {
                     }
                     Some(Slot::Done(record)) => {
                         self.ledger.apply(record);
-                        if record.kind != Kind::Free {
+                        if record.kind == Kind::Nested {
+                            let reason = format!(
+                                "record {index} is a hooked call from outside its allocator, made while another was open (R40)"
+                            );
+                            self.notes.push(format!("{reason}: counts are incomplete"));
+                            self.untrusted.get_or_insert(reason);
+                        }
+                        if !matches!(record.kind, Kind::Free | Kind::Nested) {
                             self.allocations_since_check += 1;
                         }
                         index += 1;

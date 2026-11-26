@@ -42,8 +42,9 @@ const EXIT_OFFSET: u64 = 0x1000;
 /// Each hook's entry trampoline, displaced instructions and tail share one block.
 const BLOCK_LEN: u64 = 0x200;
 /// Where the displaced instructions start within a block. The entry trampoline
-/// must assemble to fewer bytes than this.
-const DISPLACED_OFFSET: u64 = 0x180;
+/// must assemble to fewer bytes than this. The displaced instructions and the
+/// tail share the rest of the block.
+const DISPLACED_OFFSET: u64 = 0x1c0;
 /// The hook region's length. Reachability scans skip this mapping (P4b).
 pub const REGION_LEN: u64 = RECORDS_OFFSET + CAPACITY * RECORD_LEN as u64;
 const INDEX_MASK: i32 = (CAPACITY - 1) as i32;
@@ -63,10 +64,12 @@ const _: () = assert!(PENDING_OFFSET + 0x1_0000 == RECORDS_OFFSET);
 const _: () = assert!(DEPTH_OFFSET + 8 <= PENDING_OFFSET);
 const _: () = assert!(HOOKS.len() as u64 * BLOCK_LEN <= EXIT_OFFSET);
 
-/// One hooked function: its symbol, what its record holds, and its block.
+/// One hooked function: its symbol, the kind of its record, the argument
+/// registers the record holds as `(size, pointer argument)`, and its block.
 struct Hook {
     symbol: &'static str,
     kind: Kind,
+    captured: (Option<AsmRegister64>, Option<AsmRegister64>),
     block: u64,
 }
 
@@ -78,41 +81,49 @@ const HOOKS: [Hook; 8] = [
     Hook {
         symbol: "malloc",
         kind: Kind::Malloc,
+        captured: (Some(rdi), None),
         block: 0,
     },
     Hook {
         symbol: "free",
         kind: Kind::Free,
+        captured: (None, Some(rdi)),
         block: BLOCK_LEN,
     },
     Hook {
         symbol: "realloc",
         kind: Kind::Realloc,
+        captured: (Some(rsi), Some(rdi)),
         block: 2 * BLOCK_LEN,
     },
     Hook {
         symbol: "calloc",
         kind: Kind::Calloc,
+        captured: (Some(rdi), Some(rsi)),
         block: 3 * BLOCK_LEN,
     },
     Hook {
         symbol: "memalign",
         kind: Kind::Memalign,
+        captured: (Some(rsi), None),
         block: 4 * BLOCK_LEN,
     },
     Hook {
         symbol: "aligned_alloc",
         kind: Kind::Memalign,
+        captured: (Some(rsi), None),
         block: 5 * BLOCK_LEN,
     },
     Hook {
         symbol: "valloc",
         kind: Kind::Valloc,
+        captured: (Some(rdi), None),
         block: 6 * BLOCK_LEN,
     },
     Hook {
         symbol: "pvalloc",
         kind: Kind::Valloc,
+        captured: (Some(rdi), None),
         block: 7 * BLOCK_LEN,
     },
 ];
@@ -216,7 +227,7 @@ pub fn install_hooks_at<T: Tracer>(
         let plan = hook::plan(addr, function, &refs, block, block + DISPLACED_OFFSET)?;
         let original = tracer.read_mem(pid, plan.patch_at, JMP_LEN)?;
         let original: [u8; JMP_LEN] = original.try_into().expect("read JMP_LEN bytes");
-        planned.push((hook, plan, original));
+        planned.push((hook, plan, original, (addr, addr + function.len() as u64)));
     }
 
     burn_exec_step(tracer, pid, pending_signals)?;
@@ -231,9 +242,9 @@ pub fn install_hooks_at<T: Tracer>(
         return Err(InstallError::MmapFailed(mapped));
     }
 
-    for (hook, plan, _) in &planned {
+    for (hook, plan, _, outer) in &planned {
         let block = hint + hook.block;
-        let mut code = pad_to(entry_code(hint, block, hook.kind), DISPLACED_OFFSET);
+        let mut code = pad_to(entry_code(hint, block, hook, *outer), DISPLACED_OFFSET);
         code.extend_from_slice(&plan.displaced_code);
         let resume = plan.patch_at + plan.patch_len as u64;
         let tail_at = block + DISPLACED_OFFSET + plan.displaced_code.len() as u64;
@@ -243,7 +254,7 @@ pub fn install_hooks_at<T: Tracer>(
     tracer.write_mem(pid, hint + EXIT_OFFSET, &exit_code(hint))?;
 
     let mut patches = Vec::with_capacity(planned.len());
-    for (_, plan, original) in planned {
+    for (_, plan, original, _) in planned {
         if let Err(error) = tracer.write_mem(pid, plan.patch_at, &plan.jump) {
             restore(tracer, pid, &patches);
             return Err(error.into());
@@ -442,30 +453,33 @@ fn pad_to(code: Vec<u8>, len: u64) -> Vec<u8> {
         .expect(LAYOUT)
 }
 
-/// The entry trampoline for `kind`, assembled to run at `block`. When no call
+/// The entry trampoline for `hook`, assembled to run at `block`. When no call
 /// is already being recorded, it stores the call's arguments in a new record,
-/// parks the caller's return address with the record, and returns through the
-/// exit stub. Then it runs the displaced instructions.
-fn entry_code(base: u64, block: u64, kind: Kind) -> Vec<u8> {
+/// parks the caller's return address and the address range of the function
+/// with the record, and returns through the exit stub. A nested call is
+/// recorded as `Kind::Nested` unless it is harmless (R40). Then it runs the
+/// displaced instructions. `outer` is the range `[start, end)` of the hooked
+/// function's own code.
+fn entry_code(base: u64, block: u64, hook: &Hook, outer: (u64, u64)) -> Vec<u8> {
     let head = base + HEAD_OFFSET;
     let depth = base + DEPTH_OFFSET;
     let records = base + RECORDS_OFFSET;
     let pending = base + PENDING_OFFSET;
     let exit = base + EXIT_OFFSET;
     let displaced = block + DISPLACED_OFFSET;
-    let (size, arg) = captured(kind);
+    let (size, arg) = hook.captured;
 
     let mut a = CodeAssembler::new(64).expect(ASM_NEW);
-    let mut skip = a.create_label();
+    let mut nested = a.create_label();
+    let mut record_nested = a.create_label();
+    let mut done = a.create_label();
     a.pushfq().expect(ASM);
     for reg in [rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11] {
         a.push(reg).expect(ASM);
     }
-    // A nested call is not recorded, and its return address is left alone, so
-    // the outer call's exit stub still runs.
     a.mov(r11, depth).expect(ASM);
     a.cmp(qword_ptr(r11), 0i32).expect(ASM);
-    a.jne(skip).expect(ASM);
+    a.jne(nested).expect(ASM);
     a.mov(qword_ptr(r11), 1i32).expect(ASM);
     // rax = record index: the ring head, bumped and masked.
     a.mov(r11, head).expect(ASM);
@@ -488,34 +502,61 @@ fn entry_code(base: u64, block: u64, kind: Kind) -> Vec<u8> {
     } else {
         a.mov(qword_ptr(rcx + 16), 0i32).expect(ASM);
     }
-    a.mov(qword_ptr(rcx + 32), kind as i32).expect(ASM);
+    a.mov(qword_ptr(rcx + 32), hook.kind as i32).expect(ASM);
     a.mov(qword_ptr(rcx + 40), 0i32).expect(ASM);
-    // Pending: the caller's return address, and the record it belongs to.
+    // Pending: the caller's return address, the record it belongs to, and the
+    // address range of the function that made the call.
     a.mov(r10, pending).expect(ASM);
     a.mov(qword_ptr(r10), rdx).expect(ASM);
     a.mov(qword_ptr(r10 + 8), rcx).expect(ASM);
+    a.mov(r9, outer.0).expect(ASM);
+    a.mov(qword_ptr(r10 + 16), r9).expect(ASM);
+    a.mov(r9, outer.1).expect(ASM);
+    a.mov(qword_ptr(r10 + 24), r9).expect(ASM);
     // Return through the exit stub, which stores the result.
     a.mov(rdx, exit).expect(ASM);
     a.mov(qword_ptr(rsp + 80), rdx).expect(ASM);
-    a.set_label(&mut skip).expect(ASM);
+    a.jmp(done).expect(ASM);
+    // A nested call. A return address at the exit stub is a tail jump from
+    // another hooked function, and one inside the outer function is glibc calling
+    // a hooked entry from its own body. Both are harmless and are not recorded.
+    // Any other caller is recorded as `Kind::Nested`, so the monitor stops
+    // trusting the ledger (R40). Nothing here touches the depth counter or the
+    // pending slot, which belong to the outer call.
+    a.set_label(&mut nested).expect(ASM);
+    a.mov(rdx, qword_ptr(rsp + 80)).expect(ASM);
+    a.mov(r9, exit).expect(ASM);
+    a.cmp(rdx, r9).expect(ASM);
+    a.je(done).expect(ASM);
+    a.mov(r10, pending).expect(ASM);
+    a.mov(r9, qword_ptr(r10 + 16)).expect(ASM);
+    a.cmp(rdx, r9).expect(ASM);
+    a.jb(record_nested).expect(ASM);
+    a.mov(r9, qword_ptr(r10 + 24)).expect(ASM);
+    a.cmp(rdx, r9).expect(ASM);
+    a.jb(done).expect(ASM);
+    a.set_label(&mut record_nested).expect(ASM);
+    a.mov(r11, head).expect(ASM);
+    a.mov(eax, 1).expect(ASM);
+    a.lock().xadd(qword_ptr(r11), rax).expect(ASM);
+    a.and(rax, INDEX_MASK).expect(ASM);
+    a.mov(rcx, rax).expect(ASM);
+    a.shl(rcx, 6).expect(ASM);
+    a.mov(r11, records).expect(ASM);
+    a.add(rcx, r11).expect(ASM);
+    a.mov(qword_ptr(rcx), 0i32).expect(ASM);
+    a.mov(qword_ptr(rcx + 8), rdx).expect(ASM);
+    a.mov(qword_ptr(rcx + 16), 0i32).expect(ASM);
+    a.mov(qword_ptr(rcx + 24), 0i32).expect(ASM);
+    a.mov(qword_ptr(rcx + 32), Kind::Nested as i32).expect(ASM);
+    a.mov(qword_ptr(rcx + 40), 1i32).expect(ASM);
+    a.set_label(&mut done).expect(ASM);
     for reg in [r11, r10, r9, r8, rdi, rsi, rdx, rcx, rax] {
         a.pop(reg).expect(ASM);
     }
     a.popfq().expect(ASM);
     a.jmp(displaced).expect(ASM);
     a.assemble(block).expect(ASM)
-}
-
-/// The argument registers the entry trampoline records for `kind`:
-/// `(size, pointer argument)`.
-fn captured(kind: Kind) -> (Option<AsmRegister64>, Option<AsmRegister64>) {
-    match kind {
-        Kind::Malloc | Kind::Valloc => (Some(rdi), None),
-        Kind::Free => (None, Some(rdi)),
-        Kind::Realloc => (Some(rsi), Some(rdi)),
-        Kind::Calloc => (Some(rdi), Some(rsi)),
-        Kind::Memalign => (Some(rsi), None),
-    }
 }
 
 /// The exit stub, placed at `base + EXIT_OFFSET`. It stores `rax` (the result)

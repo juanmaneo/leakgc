@@ -56,6 +56,8 @@ impl Ledger {
                 }
                 self.insert(record);
             }
+            // Holds no block. The monitor marks the ledger untrusted (R40).
+            Kind::Nested => {}
         }
     }
 

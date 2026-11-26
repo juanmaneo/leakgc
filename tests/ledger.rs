@@ -137,6 +137,21 @@ fn a_free_of_a_pointer_never_seen_is_counted() {
 }
 
 #[test]
+fn a_nested_call_holds_nothing_and_counts_as_no_free() {
+    let mut ledger = Ledger::default();
+    ledger.apply(Record {
+        kind: Kind::Nested,
+        size: 16,
+        caller: A,
+        arg: 0x1000,
+        result: 0x2000,
+    });
+
+    assert!(ledger.sites().is_empty());
+    assert_eq!(ledger.unknown_frees(), 0);
+}
+
+#[test]
 fn a_realloc_that_moves_releases_the_old_block_and_holds_the_new_one() {
     let mut ledger = Ledger::default();
     ledger.apply(malloc(A, 16, 0x1000));

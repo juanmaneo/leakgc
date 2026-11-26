@@ -228,6 +228,69 @@ fn overwritten_records_are_noted_before_the_read() {
 }
 
 #[test]
+fn a_nested_call_from_outside_its_allocator_makes_the_ledger_untrusted() {
+    let mut h = hooked();
+    map_writable(&mut h.fake, 0x7000, 0x9000);
+    set_head(&mut h.fake, 2);
+    write_slot(&mut h.fake, 0, malloc_record(16, 0x7000), true);
+    write_slot(
+        &mut h.fake,
+        1,
+        Record {
+            kind: Kind::Nested,
+            size: 0,
+            caller: CALLER,
+            arg: 0,
+            result: 0,
+        },
+        true,
+    );
+    put_word(&mut h.fake, RSP + 0x100, 0x7000);
+
+    h.monitor.trapped(&mut h.fake, pid(), None);
+
+    let report = only(h.monitor.finish());
+    let reason =
+        "record 1 is a hooked call from outside its allocator, made while another was open (R40)";
+    assert!(has_note(&report, "record 1 is a hooked call"));
+    assert_eq!(
+        report.reachability,
+        Reachability::Incomplete(reason.to_string())
+    );
+    assert_eq!(
+        report.sites,
+        vec![Site {
+            caller: CALLER,
+            blocks: 1,
+            bytes: 16
+        }]
+    );
+}
+
+#[test]
+fn a_nested_call_does_not_count_toward_collect_every() {
+    let mut h = hooked_every(1);
+    set_head(&mut h.fake, 1);
+    write_slot(
+        &mut h.fake,
+        0,
+        Record {
+            kind: Kind::Nested,
+            size: 0,
+            caller: CALLER,
+            arg: 0,
+            result: 0,
+        },
+        true,
+    );
+
+    h.monitor.trapped(&mut h.fake, pid(), None);
+
+    let report = only(h.monitor.finish());
+    assert_eq!(report.reachability, Reachability::Unchecked);
+}
+
+#[test]
 fn a_clone_that_shares_memory_removes_the_hooks() {
     let mut h = hooked();
     set_head(&mut h.fake, 0);

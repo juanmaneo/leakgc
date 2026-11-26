@@ -15,6 +15,8 @@ pub const RECORD_LEN: usize = 64;
 /// Which hooked function a record came from. The trampolines store these values.
 /// `Memalign` covers `memalign` and `aligned_alloc`, which take the size second.
 /// `Valloc` covers `valloc` and `pvalloc`, which take only the size.
+/// `Nested` marks a hooked call from outside its allocator while another was
+/// open (R40). It carries no block, and it makes the monitor stop trusting the ledger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Malloc = 1,
@@ -23,6 +25,7 @@ pub enum Kind {
     Calloc = 4,
     Memalign = 5,
     Valloc = 6,
+    Nested = 7,
 }
 
 impl Kind {
@@ -34,6 +37,7 @@ impl Kind {
             4 => Some(Kind::Calloc),
             5 => Some(Kind::Memalign),
             6 => Some(Kind::Valloc),
+            7 => Some(Kind::Nested),
             _ => None,
         }
     }

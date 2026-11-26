@@ -102,6 +102,7 @@ fn static_binary_reports_its_outstanding_blocks_by_caller() {
     assert!(log.contains("exit code 0"), "log:\n{log}");
     assert!(!log.contains("not covered"), "log:\n{log}");
     assert!(!log.contains("unknown frees"), "log:\n{log}");
+    assert!(!log.contains("R40"), "log:\n{log}");
 }
 
 /// Each entry point the hooks cover reports its own block. `calloc` reports
@@ -120,6 +121,7 @@ fn static_binary_records_every_hooked_allocator_entry() {
     assert!(log.contains("1 blocks, 10 bytes"), "log:\n{log}");
     assert!(log.contains("1 blocks, 20 bytes"), "log:\n{log}");
     assert!(!log.contains("1 blocks, 100 bytes"), "log:\n{log}");
+    assert!(!log.contains("R40"), "log:\n{log}");
 }
 
 /// The 333-byte block is the only one nothing points to when the trapped
@@ -149,6 +151,7 @@ fn static_binary_reports_only_the_block_nothing_points_to() {
         unreachable[0].ends_with("1 blocks, 333 bytes"),
         "log:\n{log}"
     );
+    assert!(!log.contains("R40"), "log:\n{log}");
 }
 
 #[test]
