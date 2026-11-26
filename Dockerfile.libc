@@ -7,6 +7,7 @@
 #   scripts/libc-tests.sh glibc
 #   scripts/libc-tests.sh musl
 #   scripts/libc-tests.sh cosmo
+#   scripts/libc-tests.sh relibc
 #
 # Plain Dockerfile syntax only, so `docker build` and `podman build` both work.
 
@@ -63,3 +64,31 @@ ENV PATH="/root/.cargo/bin:${PATH}:/opt/cosmocc/bin" \
     CARGO_TARGET_DIR="/cargo-target"
 WORKDIR /workspace
 CMD ["cargo", "test", "--locked", "--test", "libc_cosmo", "--", "--ignored"]
+
+# relibc, Redox OS's C library written in Rust (PLAN D74, beta). Its sysroot is
+# built here from a pinned revision. The build uses the nightly that relibc's own
+# rust-toolchain.toml names, which rustup installs on first use, so the default
+# toolchain only builds cbindgen and runs the tests. The tests need the relibc
+# feature, so this image runs only them.
+FROM gcc:16 AS relibc
+ARG RUST_TOOLCHAIN
+ARG RELIBC_REV=c222551930b0cc1aacf8d04b0b449e078de63ece
+ARG CBINDGEN_VERSION=0.29.4
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --no-modify-path --profile minimal \
+      --default-toolchain "${RUST_TOOLCHAIN}"
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN cargo install cbindgen --version "${CBINDGEN_VERSION}" --locked
+RUN git clone https://gitlab.redox-os.org/redox-os/relibc.git /opt/relibc \
+    && git -C /opt/relibc checkout "${RELIBC_REV}" \
+    && git -C /opt/relibc submodule update --init --recursive
+# The build directory stays the default /opt/relibc/target. CARGO_TARGET_DIR is set
+# only for the test run below, so it cannot redirect the sysroot build.
+WORKDIR /opt/relibc
+RUN make all TARGET=x86_64-unknown-linux-gnu CC=gcc LD=ld AR=ar NM=nm OBJCOPY=objcopy \
+    && make install TARGET=x86_64-unknown-linux-gnu DESTDIR=/opt/relibc-sysroot
+ENV LEAKGC_RELIBC_SYSROOT=/opt/relibc-sysroot \
+    CARGO_TARGET_DIR="/cargo-target"
+WORKDIR /workspace
+CMD ["cargo", "test", "--locked", "--features", "relibc", "--test", "libc_relibc", "--", "--ignored"]
