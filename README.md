@@ -24,6 +24,18 @@ Early work. Freeing works for static, non-PIE glibc programs that run in one thr
 
 Freeing memory the program still uses corrupts it. The design is fail-closed: a block that cannot be seen, or is not understood, is never freed. See `PLAN.md` (risks R1 to R3) for what that does and does not guarantee.
 
+## Supported C libraries
+
+| C library | Hooks and reports | Freeing |
+|---|---|---|
+| glibc, static non-PIE, one thread | yes | yes |
+| glibc, dynamic or PIE | yes | no (D71) |
+| musl, static or dynamic | yes | no (D80) |
+| Cosmopolitan, the ELF inside the APE | yes | no (D86) |
+| relibc, static (beta, D74) | yes | no (no internal allocator names, R37) |
+
+Stripped binaries get no hooks yet (D7). The Cosmopolitan APE that ships is stripped, so it gets none.
+
 ## Requirements
 
 - Linux with `ptrace` and seccomp. Run `leakgc` outside sandboxes that block tracing (for example, a firejail profile without `allow-debuggers`).
@@ -48,6 +60,8 @@ cargo xtask coverage
 ```
 
 `cargo xtask coverage` requires every file in `src/` to be at 100% functions, lines and regions. The `tests/` directory is not part of that gate.
+
+The C library tests run in one Docker image per library: `sh scripts/libc-tests.sh glibc`, `musl`, `cosmo` or `relibc` (the beta).
 
 ## Documents
 

@@ -11,7 +11,7 @@ No code from these projects is copied.
 - **OCaml runtime.** The tri-color mark-and-sweep reference. The OCaml prototype in `ocaml/leakcheck.ml` is original code for this project, and it is the test oracle for the Rust core.
 - **Blink** (jart/blink, ISC). The structure of a user-space monitor that passes most calls through and intercepts a selected set. `leakgc` does not interpret instructions, and no Blink code is used.
 
-Investigated and not used: **Cosmopolitan Libc** (ISC). It does not intercept syscalls from foreign code, so neither its design nor its code is taken.
+Investigated, and its design and code are not used: **Cosmopolitan Libc** (ISC) does not intercept syscalls from foreign code. Its toolchain is a test tool only (see Test targets).
 
 ## Shipped code
 
@@ -51,5 +51,6 @@ The spikes and the planned P3 test matrix run programs against these allocators 
 - mimalloc, jemalloc, gperftools tcmalloc, oneTBB (tbbmalloc and its malloc proxy)
 - Scudo and LeakSanitizer (LLVM compiler-rt)
 - Boehm gc
-- relibc (test only, D13)
+- relibc (MIT, Redox OS), built from its pinned source for the beta tests (D74). Its headers are generated with cbindgen 0.29.4 (MPL-2.0), a build-time tool that is not distributed.
+- Cosmopolitan Libc 4.0.2 (cosmocc, ISC). Its toolchain is downloaded from its GitHub release, checked by SHA-256, and run by the cosmo test image (D72, D75).
 - Wine (the real build and the user's Rust port) and firejail (the sandbox wrapper from D15). They are run under test and are not distributed.
