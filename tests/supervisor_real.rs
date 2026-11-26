@@ -143,6 +143,22 @@ fn static_binary_records_posix_memalign_by_the_block_it_returns() {
     assert!(!log.contains("R40"), "log:\n{log}");
 }
 
+/// `realloc(p, 0)` frees `p` from inside realloc's own code, and that inner
+/// `free` is not recorded (R40). The realloc record releases the block itself,
+/// so the report does not list it.
+#[test]
+fn static_binary_releases_a_block_that_realloc_frees_from_inside() {
+    let realloc_zero = build_c("realloc_zero_static.c", &["-static", "-no-pie"]);
+    let path = realloc_zero.to_str().expect("UTF-8 path");
+    let (status, log) = run_leakgc(&[path], &[("LEAKGC_LOG", "1")]);
+
+    assert_eq!(status.code(), Some(0), "log:\n{log}");
+    assert!(!log.contains("1 blocks, 100 bytes"), "log:\n{log}");
+    assert!(!log.contains("not covered"), "log:\n{log}");
+    assert!(!log.contains("unknown frees"), "log:\n{log}");
+    assert!(!log.contains("R40"), "log:\n{log}");
+}
+
 /// The 333-byte block is the only one nothing points to when the trapped
 /// `mmap` runs. `local` and `kept` still hold the other two. The loop before
 /// `mmap` brings the count to `COLLECT_EVERY`, so that trap runs the check
