@@ -24,7 +24,7 @@ The shipped binary is built from the following crates. The list comes from `carg
 | seccompiler | 0.5.0 | Apache-2.0 OR BSD-3-Clause | runtime |
 | bitflags | 2.13.2 | MIT OR Apache-2.0 | runtime, via nix |
 | cfg-if | 1.0.5 | MIT OR Apache-2.0 | runtime, via nix |
-| iced-x86 | 1.22.0 | MIT | runtime (decoder, encoder, block_encoder and code_asm features only) |
+| iced-x86 | 1.22.0 | MIT | runtime (std, decoder, encoder, block_encoder and code_asm features only) |
 | lazy_static | 1.5.1 | MIT OR Apache-2.0 | runtime, via iced-x86 |
 | goblin | 0.10.7 | MIT | runtime (elf32, elf64, endian_fd and std features only) |
 | scroll | 0.13.0 | MIT | runtime, via goblin |
@@ -33,7 +33,7 @@ The shipped binary is built from the following crates. The list comes from `carg
 | scroll_derive | 0.13.2 | MIT | build-time only (proc macro), via scroll |
 | cfg_aliases | 0.2.2 | MIT | build-time, via nix |
 
-The `[dependencies]` table in `Cargo.toml` names `libc`, `nix` (with `process`, `signal` and `ptrace` features only), `seccompiler`, `iced-x86` (with `decoder`, `encoder`, `block_encoder` and `code_asm` features only) and `goblin` (with `elf32`, `elf64`, `endian_fd` and `std` features only). `scroll_derive` is a proc macro that `scroll` uses at build time, and it brings in `proc-macro2`, `quote`, `syn` and `unicode-ident`. Proc macros run at build time and are not linked into the binary, but they are on the normal dependency graph, so they are listed in the next section, next to the xtask dependencies.
+The `[dependencies]` table in `Cargo.toml` names `libc`, `nix` (with `process`, `signal` and `ptrace` features only), `seccompiler`, `iced-x86` (with `std`, `decoder`, `encoder`, `block_encoder` and `code_asm` features only) and `goblin` (with `elf32`, `elf64`, `endian_fd` and `std` features only). `scroll_derive` is a proc macro that `scroll` uses at build time, and it brings in `proc-macro2`, `quote`, `syn` and `unicode-ident`. Proc macros run at build time and are not linked into the binary, but they are on the normal dependency graph, so they are listed in the next section, next to the xtask dependencies.
 
 ## Development tools (not shipped)
 
