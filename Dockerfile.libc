@@ -1,0 +1,35 @@
+# Test images, one per C library (PLAN D73). Each image has the pinned Rust
+# toolchain and the C compiler that the tests call as `cc`. The repository is
+# mounted at run time, not copied in, and build output goes to a named volume
+# per library, so the libraries never share build output or write root-owned
+# files into the repository.
+#
+#   scripts/libc-tests.sh glibc
+#   scripts/libc-tests.sh musl
+#
+# Plain Dockerfile syntax only, so `docker build` and `podman build` both work.
+
+ARG RUST_TOOLCHAIN=1.100.0
+
+FROM gcc:16 AS glibc
+ARG RUST_TOOLCHAIN
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --no-modify-path --profile minimal \
+      --default-toolchain "${RUST_TOOLCHAIN}"
+ENV PATH="/root/.cargo/bin:${PATH}" \
+    CARGO_TARGET_DIR="/cargo-target"
+WORKDIR /workspace
+CMD ["cargo", "test", "--workspace", "--locked", "--no-fail-fast"]
+
+FROM alpine:3.20 AS musl
+ARG RUST_TOOLCHAIN
+RUN apk add --no-cache bash curl ca-certificates gcc musl-dev
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --no-modify-path --profile minimal \
+      --default-toolchain "${RUST_TOOLCHAIN}"
+ENV PATH="/root/.cargo/bin:${PATH}" \
+    CARGO_TARGET_DIR="/cargo-target"
+WORKDIR /workspace
+CMD ["cargo", "test", "--workspace", "--locked", "--no-fail-fast"]
