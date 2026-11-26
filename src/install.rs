@@ -46,6 +46,13 @@ const BLOCK_LEN: u64 = 0x200;
 /// must assemble to fewer bytes than this. The displaced instructions and the
 /// tail share the rest of the block.
 const DISPLACED_OFFSET: u64 = 0x1c0;
+/// Where the injection trampoline goes, after the exit stub. Its code is padded
+/// to `INJECT_LEN`, which ends before the ring head.
+const INJECT_OFFSET: u64 = 0x1800;
+const INJECT_LEN: u64 = 0x400;
+/// Bytes below the stack pointer that the trampoline saves FP and vector state
+/// into. The window covers the largest XSAVE area in use, AMX at about 11 KiB.
+const SAVE_LEN: i32 = 0x4000;
 /// The hook region's length. Reachability scans skip this mapping (P4b).
 pub const REGION_LEN: u64 = RECORDS_OFFSET + CAPACITY * RECORD_LEN as u64;
 const INDEX_MASK: i32 = (CAPACITY - 1) as i32;
@@ -64,6 +71,7 @@ const _: () = assert!(RECORD_LEN == 64);
 const _: () = assert!(PENDING_OFFSET + 0x1_0000 == RECORDS_OFFSET);
 const _: () = assert!(DEPTH_OFFSET + 8 <= PENDING_OFFSET);
 const _: () = assert!(HOOKS.len() as u64 * BLOCK_LEN <= EXIT_OFFSET);
+const _: () = assert!(INJECT_OFFSET + INJECT_LEN <= HEAD_OFFSET);
 
 /// One hooked function: its symbol, the kind of its record, the argument
 /// registers the record holds as `(size, pointer argument)`, and its block.
@@ -151,11 +159,14 @@ pub struct Patch {
 }
 
 /// The hooks as installed. `base` is the region, and `patches` lists every
-/// jump written into the target.
+/// jump written into the target. `trampoline` is where an injected free starts,
+/// and `stop` is the `int3` that ends it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Installed {
     pub base: u64,
     pub patches: Vec<Patch>,
+    pub trampoline: u64,
+    pub stop: u64,
 }
 
 /// Why the hooks were not installed. Every variant leaves the target unpatched,
@@ -245,6 +256,8 @@ pub fn install_hooks_at<T: Tracer>(
         planned.push((hook, plan, original));
     }
 
+    let (free, _) = function_symbol(&elf, &text, "free")
+        .expect("the planning loop found free, which is a hook");
     burn_exec_step(tracer, pid, pending_signals)?;
     let mapped = run_syscall(
         tracer,
@@ -266,7 +279,14 @@ pub fn install_hooks_at<T: Tracer>(
         code.extend_from_slice(&tail_code(resume, tail_at));
         tracer.write_mem(pid, block, &pad_to(code, BLOCK_LEN))?;
     }
-    tracer.write_mem(pid, hint + EXIT_OFFSET, &exit_code(hint))?;
+    tracer.write_mem(
+        pid,
+        hint + EXIT_OFFSET,
+        &pad_to(exit_code(hint), INJECT_OFFSET - EXIT_OFFSET),
+    )?;
+    let inject = inject_code(free, hint + INJECT_OFFSET);
+    let stop = hint + INJECT_OFFSET + inject.len() as u64 - 1;
+    tracer.write_mem(pid, hint + INJECT_OFFSET, &pad_to(inject, INJECT_LEN))?;
 
     let mut patches = Vec::with_capacity(planned.len());
     for (_, plan, original) in planned {
@@ -282,6 +302,8 @@ pub fn install_hooks_at<T: Tracer>(
     Ok(Installed {
         base: hint,
         patches,
+        trampoline: hint + INJECT_OFFSET,
+        stop,
     })
 }
 
@@ -557,6 +579,28 @@ fn entry_code(base: u64, block: u64, hook: &Hook) -> Vec<u8> {
     a.popfq().expect(ASM);
     a.jmp(displaced).expect(ASM);
     a.assemble(block).expect(ASM)
+}
+
+/// The injection trampoline, assembled to run at `ip`. The caller points `rsp`
+/// at a 64-byte-aligned stack position and `rdi` at the block to free. The
+/// trampoline saves the FP and vector state below `rsp`, calls the hooked
+/// `free`, restores that state, and stops at the `int3` that ends the code. The
+/// call clobbers the general-purpose registers, so the caller restores them.
+/// It needs XSAVE, which the caller checks.
+fn inject_code(free: u64, ip: u64) -> Vec<u8> {
+    let mut a = CodeAssembler::new(64).expect(ASM_NEW);
+    a.sub(rsp, SAVE_LEN).expect(ASM);
+    a.mov(eax, -1i32).expect(ASM);
+    a.mov(edx, -1i32).expect(ASM);
+    a.xsave64(ptr(rsp)).expect(ASM);
+    a.mov(rax, free).expect(ASM);
+    a.call(rax).expect(ASM);
+    a.mov(eax, -1i32).expect(ASM);
+    a.mov(edx, -1i32).expect(ASM);
+    a.xrstor64(ptr(rsp)).expect(ASM);
+    a.add(rsp, SAVE_LEN).expect(ASM);
+    a.int3().expect(ASM);
+    a.assemble(ip).expect(ASM)
 }
 
 /// The exit stub, placed at `base + EXIT_OFFSET`. It stores the result in the

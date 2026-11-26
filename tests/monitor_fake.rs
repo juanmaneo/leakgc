@@ -59,8 +59,8 @@ fn hooked_every(collect_every: u64) -> Hooked {
     map_line(&mut fake, DEFAULT_HINT, DEFAULT_HINT + REGION_LEN, "rwxp");
     let mut monitor = Monitor::new(collect_every);
     assert!(monitor.exec(&mut fake, pid()).is_empty());
-    assert_eq!(fake.writes.len(), 23, "the install wrote every hook");
-    let jumps = fake.writes[13..]
+    assert_eq!(fake.writes.len(), 24, "the install wrote every hook");
+    let jumps = fake.writes[14..]
         .iter()
         .map(|(at, bytes)| (*at, bytes.clone()))
         .collect();

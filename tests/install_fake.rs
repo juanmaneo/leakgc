@@ -6,7 +6,7 @@ mod common;
 
 use goblin::elf::Elf;
 use goblin::elf::section_header::SHF_EXECINSTR;
-use iced_x86::{Decoder, DecoderOptions, Instruction};
+use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic};
 use leakgc::hook::{Refusal, jmp_rel32};
 use leakgc::install::{
     DEFAULT_HINT, InstallError, Installed, install_hooks as install_hooks_with_signals,
@@ -120,7 +120,7 @@ fn installs_the_jumps_last_in_hook_order() {
     assert_eq!(installed.patches.len(), 10, "ten allocator entries");
     let blocks: Vec<u64> = (0..10).map(|i| i * 0x200).collect();
     let writes = &fake.writes;
-    assert_eq!(writes.len(), 2 + blocks.len() + 1 + 10, "write count");
+    assert_eq!(writes.len(), 2 + blocks.len() + 1 + 1 + 10, "write count");
     assert_eq!(writes[0], (rip, SYSCALL.to_vec()), "syscall bytes");
     assert_eq!(writes[1].0, rip, "syscall bytes restored");
     for (i, block) in blocks.iter().enumerate() {
@@ -129,15 +129,65 @@ fn installs_the_jumps_last_in_hook_order() {
         assert_eq!(code.len(), 0x200, "block {i} is written whole");
     }
     assert_eq!(writes[12].0, DEFAULT_HINT + 0x1400, "exit stub");
+    assert_eq!(writes[13].0, DEFAULT_HINT + 0x1800, "trampoline");
     for (i, patch) in installed.patches.iter().enumerate() {
         let jump = jmp_rel32(patch.at, DEFAULT_HINT + blocks[i]).expect("in reach");
         assert_eq!(
-            writes[13 + i],
+            writes[14 + i],
             (patch.at, jump.to_vec()),
             "jump {i} is written last, in hook order"
         );
     }
     assert_eq!(fake.regs.rip, rip, "registers restored");
+}
+
+#[test]
+fn the_trampoline_saves_calls_free_restores_and_stops_at_an_int3() {
+    let image = static_image();
+    let mut fake = Fake::new(image, vec![trap(), seccomp(), trap()]);
+    let installed = install_hooks(&mut fake, pid()).expect("installs");
+    let elf = Elf::parse(image).expect("test image parses");
+    let free = elf
+        .syms
+        .iter()
+        .find(|sym| sym.is_function() && elf.strtab.get_at(sym.st_name) == Some("free"))
+        .expect("static image defines free")
+        .st_value;
+
+    assert_eq!(installed.trampoline, DEFAULT_HINT + 0x1800);
+    let code = fake.bytes(
+        installed.trampoline,
+        (installed.stop - installed.trampoline + 1) as usize,
+    );
+    assert_eq!(fake.bytes(installed.stop, 1), [0xcc], "the stop is an int3");
+    let mut decoder = Decoder::with_ip(64, &code, installed.trampoline, DecoderOptions::NONE);
+    let mut instructions: Vec<Instruction> = Vec::new();
+    while decoder.can_decode() {
+        instructions.push(decoder.decode());
+    }
+    let mnemonics: Vec<Mnemonic> = instructions.iter().map(Instruction::mnemonic).collect();
+    assert_eq!(
+        mnemonics,
+        [
+            Mnemonic::Sub,
+            Mnemonic::Mov,
+            Mnemonic::Mov,
+            Mnemonic::Xsave64,
+            Mnemonic::Mov,
+            Mnemonic::Call,
+            Mnemonic::Mov,
+            Mnemonic::Mov,
+            Mnemonic::Xrstor64,
+            Mnemonic::Add,
+            Mnemonic::Int3,
+        ]
+    );
+    assert_eq!(instructions[0].immediate32(), 0x4000, "the save window");
+    for mask in [1, 2, 6, 7] {
+        assert_eq!(instructions[mask].immediate32(), u32::MAX, "all state");
+    }
+    assert_eq!(instructions[4].immediate64(), free, "calls the hooked free");
+    assert_eq!(instructions[9].immediate32(), 0x4000, "releases the window");
 }
 
 #[test]
