@@ -1,14 +1,13 @@
 //! Supervision of real processes through the `leakgc` binary. Each run has a
 //! deadline, so a supervision hang fails the test instead of stalling it.
 
-use std::fs;
-use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+mod common;
 
-const TIMEOUT: Duration = Duration::from_secs(60);
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use common::run_leakgc;
 
 fn target_dir() -> &'static Path {
     Path::new(env!("CARGO_TARGET_TMPDIR"))
@@ -35,46 +34,6 @@ fn build_c_named(source: &str, out_name: &str, flags: &[&str]) -> PathBuf {
         .expect("run cc");
     assert!(status.success(), "cc failed for {source}");
     out
-}
-
-/// Runs `leakgc` with only the variables given here. `cargo test` sets
-/// `LD_LIBRARY_PATH`, and a static C library reads it at startup and allocates
-/// for it. That changes the traced program's blocks and its reachability, so a
-/// run must not inherit the test runner's environment.
-fn run_leakgc(args: &[&str], env: &[(&str, &str)]) -> (ExitStatus, String) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_leakgc"));
-    command.args(args).env_clear().envs(env.iter().copied());
-    // cargo-llvm-cov sets this so the binary saves its counters. Keeping it keeps
-    // these runs in the coverage report.
-    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
-        command.env("LLVM_PROFILE_FILE", profile);
-    }
-    let mut child = command
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn leakgc");
-    let mut stderr = child.stderr.take().expect("stderr is piped");
-    let reader = thread::spawn(move || {
-        let mut text = String::new();
-        stderr
-            .read_to_string(&mut text)
-            .expect("read leakgc stderr");
-        text
-    });
-
-    let deadline = Instant::now() + TIMEOUT;
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("poll leakgc") {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            child.kill().expect("kill hung leakgc");
-            child.wait().expect("reap hung leakgc");
-            panic!("leakgc did not finish within {TIMEOUT:?}");
-        }
-        thread::sleep(Duration::from_millis(10));
-    };
-    (status, reader.join().expect("stderr reader"))
 }
 
 #[test]
