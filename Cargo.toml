@@ -8,6 +8,12 @@ license = "MIT"
 name = "leakgc"
 path = "src/main.rs"
 
+# relibc test target (D74). Its tests need the sysroot from `make install`, so a
+# plain `cargo test` does not build them.
+[[test]]
+name = "libc_relibc"
+required-features = ["relibc"]
+
 [workspace]
 members = [".", "xtask"]
 resolver = "3"
@@ -17,6 +23,10 @@ unsafe_code = "forbid"
 
 [lints]
 workspace = true
+
+[features]
+# relibc is an opt-in beta (D74). Enabling it only builds the relibc tests.
+relibc = []
 
 [dependencies]
 libc = "0.2.189"
