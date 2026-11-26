@@ -152,6 +152,34 @@ fn a_nested_call_holds_nothing_and_counts_as_no_free() {
 }
 
 #[test]
+fn a_posix_memalign_holds_the_block_it_returned_and_free_releases_it() {
+    let mut ledger = Ledger::default();
+    ledger.apply(aligned(Kind::PosixMemalign, A, 100, 0x2000));
+    assert_eq!(ledger.sites(), vec![site(A, 1, 100)]);
+
+    ledger.apply(free(B, 0x2000));
+    assert!(ledger.sites().is_empty());
+    assert_eq!(ledger.unknown_frees(), 0);
+}
+
+#[test]
+fn a_posix_memalign_that_failed_holds_nothing() {
+    let mut ledger = Ledger::default();
+    ledger.apply(aligned(Kind::PosixMemalign, A, 50, 0));
+
+    assert!(ledger.sites().is_empty());
+}
+
+#[test]
+fn a_malloc_trim_holds_nothing_and_counts_as_no_free() {
+    let mut ledger = Ledger::default();
+    ledger.apply(aligned(Kind::MallocTrim, A, 0, 1));
+
+    assert!(ledger.sites().is_empty());
+    assert_eq!(ledger.unknown_frees(), 0);
+}
+
+#[test]
 fn a_realloc_that_moves_releases_the_old_block_and_holds_the_new_one() {
     let mut ledger = Ledger::default();
     ledger.apply(malloc(A, 16, 0x1000));

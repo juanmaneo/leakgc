@@ -134,7 +134,7 @@ impl Process {
                             self.notes.push(format!("{reason}: counts are incomplete"));
                             self.untrusted.get_or_insert(reason);
                         }
-                        if !matches!(record.kind, Kind::Free | Kind::Nested) {
+                        if !matches!(record.kind, Kind::Free | Kind::Nested | Kind::MallocTrim) {
                             self.allocations_since_check += 1;
                         }
                         index += 1;
@@ -244,7 +244,7 @@ impl Monitor {
             Ok(hook) => {
                 process.hook = Some(hook);
                 process.notes.push(
-                    "hooked malloc, free, realloc, calloc, memalign, aligned_alloc, valloc and pvalloc; allocations after the last trapped call are not read (D34)"
+                    "hooked malloc, free, realloc, calloc, memalign, aligned_alloc, valloc, pvalloc, posix_memalign and malloc_trim; allocations after the last trapped call are not read (D34)"
                         .to_string(),
                 );
             }

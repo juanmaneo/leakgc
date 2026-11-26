@@ -53,9 +53,20 @@ fn plan_symbol(image: &[u8], name: &str) -> Result<Plan, Refusal> {
 }
 
 #[test]
-fn the_planner_accepts_malloc_free_and_realloc() {
+fn the_planner_accepts_every_hooked_entry() {
     let image = static_image();
-    for name in ["malloc", "free", "realloc"] {
+    for name in [
+        "malloc",
+        "free",
+        "realloc",
+        "calloc",
+        "memalign",
+        "aligned_alloc",
+        "valloc",
+        "pvalloc",
+        "posix_memalign",
+        "malloc_trim",
+    ] {
         let planned = plan_symbol(&image, name);
         assert!(planned.is_ok(), "{name} refused: {planned:?}");
     }

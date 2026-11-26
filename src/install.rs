@@ -38,7 +38,7 @@ pub const RECORDS_OFFSET: u64 = 0x3_0000;
 
 const DEPTH_OFFSET: u64 = HEAD_OFFSET + 8;
 const PENDING_OFFSET: u64 = 0x2_0000;
-const EXIT_OFFSET: u64 = 0x1000;
+const EXIT_OFFSET: u64 = 0x1400;
 /// Each hook's entry trampoline, displaced instructions and tail share one block.
 const BLOCK_LEN: u64 = 0x200;
 /// Where the displaced instructions start within a block. The entry trampoline
@@ -77,7 +77,9 @@ struct Hook {
 /// internal `_int_malloc` or `_int_memalign`, not the hooked `malloc`, so they
 /// are hooked on their own. Otherwise their blocks are never recorded, and a
 /// trap inside them would look like a safe point (PLAN 4.8, D54).
-const HOOKS: [Hook; 8] = [
+/// `posix_memalign` and `malloc_trim` follow the same rule (R39). Both are
+/// required: glibc's static `malloc.o` defines them with every other entry.
+const HOOKS: [Hook; 10] = [
     Hook {
         symbol: "malloc",
         kind: Kind::Malloc,
@@ -125,6 +127,18 @@ const HOOKS: [Hook; 8] = [
         kind: Kind::Valloc,
         captured: (Some(rdi), None),
         block: 7 * BLOCK_LEN,
+    },
+    Hook {
+        symbol: "posix_memalign",
+        kind: Kind::PosixMemalign,
+        captured: (Some(rdx), Some(rdi)),
+        block: 8 * BLOCK_LEN,
+    },
+    Hook {
+        symbol: "malloc_trim",
+        kind: Kind::MallocTrim,
+        captured: (None, None),
+        block: 9 * BLOCK_LEN,
     },
 ];
 
@@ -559,18 +573,31 @@ fn entry_code(base: u64, block: u64, hook: &Hook, outer: (u64, u64)) -> Vec<u8> 
     a.assemble(block).expect(ASM)
 }
 
-/// The exit stub, placed at `base + EXIT_OFFSET`. It stores `rax` (the result)
-/// in the record the pending slot names, clears the depth counter, and returns
-/// to the caller.
+/// The exit stub, placed at `base + EXIT_OFFSET`. It stores the result in the
+/// record the pending slot names, clears the depth counter, and returns to the
+/// caller with `rax` unchanged. `posix_memalign` returns an error number and
+/// writes its block through its first argument, so for that kind the stored
+/// result is the block on success and zero on failure (R39).
 fn exit_code(base: u64) -> Vec<u8> {
     let depth = base + DEPTH_OFFSET;
     let pending = base + PENDING_OFFSET;
 
     let mut a = CodeAssembler::new(64).expect(ASM_NEW);
+    let mut store = a.create_label();
     a.mov(r10, pending).expect(ASM);
     a.mov(r11, qword_ptr(r10)).expect(ASM);
     a.mov(rcx, qword_ptr(r10 + 8)).expect(ASM);
-    a.mov(qword_ptr(rcx + 24), rax).expect(ASM);
+    a.mov(rdx, rax).expect(ASM);
+    a.cmp(qword_ptr(rcx + 32), Kind::PosixMemalign as i32)
+        .expect(ASM);
+    a.jne(store).expect(ASM);
+    a.xor(rdx, rdx).expect(ASM);
+    a.test(rax, rax).expect(ASM);
+    a.jne(store).expect(ASM);
+    a.mov(rdx, qword_ptr(rcx + 16)).expect(ASM);
+    a.mov(rdx, qword_ptr(rdx)).expect(ASM);
+    a.set_label(&mut store).expect(ASM);
+    a.mov(qword_ptr(rcx + 24), rdx).expect(ASM);
     a.mov(qword_ptr(rcx + 40), 1i32).expect(ASM);
     a.mov(r10, depth).expect(ASM);
     a.mov(qword_ptr(r10), 0i32).expect(ASM);

@@ -41,6 +41,8 @@ fn each_hooked_function_has_its_own_kind() {
         (4, Kind::Calloc),
         (5, Kind::Memalign),
         (6, Kind::Valloc),
+        (8, Kind::PosixMemalign),
+        (9, Kind::MallocTrim),
     ] {
         let bytes = slot(0, 0x10, 0x20, 0x30, word, 1);
         assert_eq!(
@@ -79,7 +81,7 @@ fn a_nested_call_is_a_finished_record_with_no_block() {
 
 #[test]
 fn a_slot_with_an_unknown_kind_is_corrupt() {
-    for word in [0, 8, u64::MAX] {
+    for word in [0, 10, u64::MAX] {
         assert_eq!(decode(&slot(0, 0, 0, 0, word, 1)), None, "kind {word}");
     }
 }

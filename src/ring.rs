@@ -17,6 +17,9 @@ pub const RECORD_LEN: usize = 64;
 /// `Valloc` covers `valloc` and `pvalloc`, which take only the size.
 /// `Nested` marks a hooked call from outside its allocator while another was
 /// open (R40). It carries no block, and it makes the monitor stop trusting the ledger.
+/// `PosixMemalign` returns its block through its first argument, so the exit
+/// stub stores the block, not the error number (R39). `MallocTrim` carries no
+/// block. It is hooked so that a trap inside it is not taken for a safe point (R39).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Malloc = 1,
@@ -26,6 +29,8 @@ pub enum Kind {
     Memalign = 5,
     Valloc = 6,
     Nested = 7,
+    PosixMemalign = 8,
+    MallocTrim = 9,
 }
 
 impl Kind {
@@ -38,6 +43,8 @@ impl Kind {
             5 => Some(Kind::Memalign),
             6 => Some(Kind::Valloc),
             7 => Some(Kind::Nested),
+            8 => Some(Kind::PosixMemalign),
+            9 => Some(Kind::MallocTrim),
             _ => None,
         }
     }

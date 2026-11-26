@@ -24,7 +24,7 @@ const RSP: u64 = 0x7fff_f000;
 struct Hooked {
     monitor: Monitor,
     fake: Fake,
-    /// The eight jumps and the bytes each one holds after the install.
+    /// The ten jumps and the bytes each one holds after the install.
     jumps: Vec<(u64, Vec<u8>)>,
     /// The memory before the install, which holds the bytes a restore must bring back.
     pristine: BTreeMap<u64, u8>,
@@ -59,8 +59,8 @@ fn hooked_every(collect_every: u64) -> Hooked {
     map_line(&mut fake, DEFAULT_HINT, DEFAULT_HINT + REGION_LEN, "rwxp");
     let mut monitor = Monitor::new(collect_every);
     assert!(monitor.exec(&mut fake, pid()).is_empty());
-    assert_eq!(fake.writes.len(), 19, "the install wrote every hook");
-    let jumps = fake.writes[11..]
+    assert_eq!(fake.writes.len(), 23, "the install wrote every hook");
+    let jumps = fake.writes[13..]
         .iter()
         .map(|(at, bytes)| (*at, bytes.clone()))
         .collect();
@@ -288,6 +288,56 @@ fn a_nested_call_does_not_count_toward_collect_every() {
 
     let report = only(h.monitor.finish());
     assert_eq!(report.reachability, Reachability::Unchecked);
+}
+
+#[test]
+fn a_malloc_trim_does_not_count_toward_collect_every() {
+    let mut h = hooked_every(1);
+    set_head(&mut h.fake, 1);
+    write_slot(
+        &mut h.fake,
+        0,
+        Record {
+            kind: Kind::MallocTrim,
+            size: 0,
+            caller: CALLER,
+            arg: 0,
+            result: 0,
+        },
+        true,
+    );
+
+    h.monitor.trapped(&mut h.fake, pid(), None);
+
+    let report = only(h.monitor.finish());
+    assert_eq!(report.reachability, Reachability::Unchecked);
+}
+
+/// A trap inside `malloc_trim` finds its call open, so the check waits (R39).
+#[test]
+fn a_trap_inside_malloc_trim_keeps_the_last_complete_check() {
+    let mut h = hooked();
+    set_head(&mut h.fake, 0);
+    h.monitor.trapped(&mut h.fake, pid(), None);
+    set_head(&mut h.fake, 1);
+    write_slot(
+        &mut h.fake,
+        0,
+        Record {
+            kind: Kind::MallocTrim,
+            size: 0,
+            caller: CALLER,
+            arg: 0,
+            result: 0,
+        },
+        false,
+    );
+    h.fake.maps = "not a mapping\n".to_string();
+
+    h.monitor.trapped(&mut h.fake, pid(), Some(libc::SYS_brk));
+
+    let report = only(h.monitor.finish());
+    assert_eq!(report.reachability, Reachability::Checked { lost: vec![] });
 }
 
 #[test]

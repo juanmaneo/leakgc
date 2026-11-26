@@ -34,7 +34,9 @@ impl Ledger {
     /// Applies one finished call, in the order the process made it.
     pub fn apply(&mut self, record: Record) {
         match record.kind {
-            Kind::Malloc | Kind::Memalign | Kind::Valloc => self.insert(record),
+            Kind::Malloc | Kind::Memalign | Kind::Valloc | Kind::PosixMemalign => {
+                self.insert(record)
+            }
             // calloc returns NULL when the product overflows, so a block it
             // returned has an exact product, and the wrapping multiply is safe.
             Kind::Calloc => self.insert(Record {
@@ -56,8 +58,8 @@ impl Ledger {
                 }
                 self.insert(record);
             }
-            // Holds no block. The monitor marks the ledger untrusted (R40).
-            Kind::Nested => {}
+            // Hold no block. A nested call also makes the monitor mark the ledger untrusted (R40).
+            Kind::Nested | Kind::MallocTrim => {}
         }
     }
 
