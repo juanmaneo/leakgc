@@ -8,6 +8,8 @@
 //!   [`supervisor::Tracer`] trait so their control flow can be tested.
 //! - [`hook`] plans the entry patches for the allocator hooks, and [`ring`]
 //!   describes the record ring they write. Both are pure, as `gc` is.
+//! - [`inject`] decides when an injected `free` may run, so that it does not
+//!   run inside the allocator (R37, a heuristic). It is pure too.
 //! - [`install`] injects the memory and writes the patches into a stopped
 //!   static process through the [`supervisor::Tracer`] trait.
 //! - [`ledger`] turns finished calls into the blocks an image still holds,
@@ -19,6 +21,7 @@ compile_error!("leakgc's trap filter and register access are x86_64-only");
 
 pub mod gc;
 pub mod hook;
+pub mod inject;
 pub mod install;
 pub mod ledger;
 pub mod maps;

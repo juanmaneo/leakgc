@@ -191,6 +191,54 @@ fn the_trampoline_saves_calls_free_restores_and_stops_at_an_int3() {
 }
 
 #[test]
+fn the_allocator_internals_of_a_glibc_build_are_known_by_address() {
+    let image = static_image();
+    let mut fake = Fake::new(image, vec![trap(), seccomp(), trap()]);
+    let installed = install_hooks(&mut fake, pid()).expect("installs");
+    let elf = Elf::parse(image).expect("test image parses");
+    let range = |name: &str| {
+        let sym = elf
+            .syms
+            .iter()
+            .find(|sym| sym.is_function() && elf.strtab.get_at(sym.st_name) == Some(name))
+            .expect("static image defines the symbol");
+        (sym.st_value, sym.st_value + sym.st_size)
+    };
+
+    let internal = installed
+        .internal
+        .expect("a glibc build has internal ranges");
+    assert!(
+        internal.contains(&range("_int_malloc")),
+        "_int_malloc is guarded"
+    );
+    assert!(internal.contains(&range("free")), "free is guarded");
+}
+
+#[test]
+fn an_image_without_int_malloc_has_no_internal_ranges() {
+    let elf = Elf::parse(static_image()).expect("test image parses");
+    let sym = elf
+        .syms
+        .iter()
+        .find(|sym| sym.is_function() && elf.strtab.get_at(sym.st_name) == Some("_int_malloc"))
+        .expect("static image defines _int_malloc");
+    let strtab = elf
+        .section_headers
+        .iter()
+        .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".strtab"))
+        .expect(".strtab present");
+    // The name also appears in .rodata as `__func__`, which the symbol does not use.
+    let mut image = static_image().to_vec();
+    image[strtab.sh_offset as usize + sym.st_name] = b'x';
+    let mut fake = Fake::new(&image, vec![trap(), seccomp(), trap()]);
+
+    let installed = install_hooks(&mut fake, pid()).expect("installs");
+
+    assert_eq!(installed.internal, None);
+}
+
+#[test]
 fn a_failure_at_any_call_leaves_every_jump_original() {
     let image = static_image();
     let script = || vec![trap(), seccomp(), trap()];

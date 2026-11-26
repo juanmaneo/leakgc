@@ -26,6 +26,7 @@ use nix::sys::wait::WaitStatus;
 use nix::unistd::Pid;
 
 use crate::hook::{self, JMP_LEN, Refusal};
+use crate::inject::is_allocator_internal;
 use crate::ring::{CAPACITY, Kind, RECORD_LEN};
 use crate::supervisor::{PTRACE_EVENT_SECCOMP, Tracer};
 
@@ -160,13 +161,16 @@ pub struct Patch {
 
 /// The hooks as installed. `base` is the region, and `patches` lists every
 /// jump written into the target. `trampoline` is where an injected free starts,
-/// and `stop` is the `int3` that ends it.
+/// and `stop` is the `int3` that ends it. `internal` holds the `[start, end)`
+/// ranges of glibc's allocator internals (R37). It is `None` when the image is
+/// not a glibc build, so nothing is injected into it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Installed {
     pub base: u64,
     pub patches: Vec<Patch>,
     pub trampoline: u64,
     pub stop: u64,
+    pub internal: Option<Vec<(u64, u64)>>,
 }
 
 /// Why the hooks were not installed. Every variant leaves the target unpatched,
@@ -304,6 +308,7 @@ pub fn install_hooks_at<T: Tracer>(
         patches,
         trampoline: hint + INJECT_OFFSET,
         stop,
+        internal: allocator_internals(&elf),
     })
 }
 
@@ -358,6 +363,28 @@ fn function_symbol<'a>(
     let from = (sym.st_value - *start) as usize;
     let function = code.get(from..from + sym.st_size as usize).unwrap_or(&[]);
     Some((sym.st_value, function))
+}
+
+/// The `[start, end)` ranges of glibc's internal allocator functions, found by
+/// name. `None` unless `_int_malloc` is present, so a build this module does not
+/// recognise is never injected into (R37).
+fn allocator_internals(elf: &Elf) -> Option<Vec<(u64, u64)>> {
+    let functions: Vec<(&str, u64, u64)> = elf
+        .syms
+        .iter()
+        .filter(|sym| sym.is_function())
+        .map(|sym| {
+            let name = elf.strtab.get_at(sym.st_name).unwrap_or("");
+            (name, sym.st_value, sym.st_value.saturating_add(sym.st_size))
+        })
+        .collect();
+    let glibc = functions.iter().any(|(name, _, _)| *name == "_int_malloc");
+    let ranges: Vec<(u64, u64)> = functions
+        .iter()
+        .filter(|(name, _, _)| is_allocator_internal(name))
+        .map(|&(_, start, end)| (start, end))
+        .collect();
+    glibc.then_some(ranges)
 }
 
 /// Runs one instruction so the exec-stop's pending kernel state is consumed.
