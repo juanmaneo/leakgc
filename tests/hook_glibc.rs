@@ -55,7 +55,7 @@ fn plan_symbol(image: &[u8], name: &str) -> Result<Plan, Refusal> {
 #[test]
 fn the_planner_accepts_every_hooked_entry() {
     let image = static_image();
-    for name in [
+    let mut names = vec![
         "malloc",
         "free",
         "realloc",
@@ -63,10 +63,13 @@ fn the_planner_accepts_every_hooked_entry() {
         "memalign",
         "aligned_alloc",
         "valloc",
-        "pvalloc",
         "posix_memalign",
-        "malloc_trim",
-    ] {
+    ];
+    // musl has neither `pvalloc` nor `malloc_trim`.
+    if cfg!(target_env = "gnu") {
+        names.extend(["pvalloc", "malloc_trim"]);
+    }
+    for name in names {
         let planned = plan_symbol(&image, name);
         assert!(planned.is_ok(), "{name} refused: {planned:?}");
     }

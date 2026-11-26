@@ -9,7 +9,11 @@ int main(void) {
     keep[1] = memalign(64, 100);
     keep[2] = aligned_alloc(32, 128);
     keep[3] = valloc(10);
+#ifdef __GLIBC__
     keep[4] = pvalloc(20);
+#else
+    keep[4] = valloc(20);
+#endif
     free(keep[1]);
     keep[1] = NULL;
     /* A trapped call after the last allocation, so the ring is read (D34). */

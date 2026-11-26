@@ -108,12 +108,14 @@ fn static_binary_reports_its_outstanding_blocks_by_caller() {
     let (status, log) = run_leakgc(&[path], &[("LEAKGC_LOG", "1")]);
 
     assert_eq!(status.code(), Some(0), "log:\n{log}");
-    assert!(
-        log.contains(
-            "hooked malloc, free, realloc, calloc, memalign, aligned_alloc, valloc, pvalloc, posix_memalign and malloc_trim"
-        ),
-        "log:\n{log}"
-    );
+    // A static musl binary hooks only the entries it links, and this program
+    // links three. glibc links all of them, and also has `pvalloc` and `malloc_trim`.
+    let hooked = if cfg!(target_env = "gnu") {
+        "hooked malloc, free, realloc, calloc, memalign, aligned_alloc, valloc, pvalloc, posix_memalign, malloc_trim;"
+    } else {
+        "hooked malloc, free, realloc;"
+    };
+    assert!(log.contains(hooked), "log:\n{log}");
     assert!(log.contains("1 blocks, 200 bytes"), "log:\n{log}");
     assert!(log.contains("1 blocks, 40000 bytes"), "log:\n{log}");
     assert!(log.contains("exit code 0"), "log:\n{log}");
@@ -176,7 +178,12 @@ fn static_binary_records_every_hooked_allocator_entry() {
     assert!(log.contains("1 blocks, 10 bytes"), "log:\n{log}");
     assert!(log.contains("1 blocks, 20 bytes"), "log:\n{log}");
     assert!(!log.contains("1 blocks, 100 bytes"), "log:\n{log}");
-    assert!(!log.contains("R40"), "log:\n{log}");
+    // musl's calloc calls malloc for real. That nested call makes the ledger untrusted (R40).
+    if cfg!(target_env = "gnu") {
+        assert!(!log.contains("R40"), "log:\n{log}");
+    } else {
+        assert!(log.contains("(R40)"), "log:\n{log}");
+    }
 }
 
 /// `posix_memalign` holds the block it wrote through its first argument. The
@@ -195,12 +202,20 @@ fn static_binary_records_posix_memalign_by_the_block_it_returns() {
     );
     assert!(!log.contains("not covered"), "log:\n{log}");
     assert!(!log.contains("unknown frees"), "log:\n{log}");
-    assert!(!log.contains("R40"), "log:\n{log}");
+    // musl's posix_memalign calls aligned_alloc for real, which makes the ledger untrusted (R40).
+    if cfg!(target_env = "gnu") {
+        assert!(!log.contains("R40"), "log:\n{log}");
+    } else {
+        assert!(log.contains("(R40)"), "log:\n{log}");
+    }
 }
 
 /// `realloc(p, 0)` frees `p` from inside realloc's own code. That inner `free`
 /// is a nested hooked call, so the ledger is untrusted (R40, D56). The realloc
 /// record still releases the block itself, so the report does not list it.
+/// glibc only: musl's `realloc(p, 0)` returns a block instead of NULL and makes
+/// no nested free, so the scenario does not happen there.
+#[cfg(target_env = "gnu")]
 #[test]
 fn static_binary_releases_a_block_that_realloc_frees_from_inside() {
     let realloc_zero = build_c("realloc_zero_static.c", &["-static", "-no-pie"]);
@@ -276,6 +291,8 @@ fn static_binary_reports_only_the_block_nothing_points_to() {
 /// drop is zero. The fixture's `mmap` runs below a zeroed buffer, so the R37
 /// check does not refuse the frees because of stale return addresses that glibc's
 /// startup leaves in `main`'s frame (see the fixture).
+/// glibc only: the fixture reads `mallinfo2`, which musl does not have.
+#[cfg(target_env = "gnu")]
 #[test]
 fn static_binary_gets_its_unreached_blocks_freed_at_a_memory_call() {
     let fixture = build_c(
@@ -309,6 +326,30 @@ fn drop_bytes(log: &str) -> u64 {
         .expect("a drop value")
         .parse()
         .expect("a numeric drop")
+}
+
+/// musl's static image has no glibc-style internal allocator names, so injection
+/// is off and the report says so. The blocks the program leaves are still reported.
+#[cfg(not(target_env = "gnu"))]
+#[test]
+fn static_musl_binary_is_not_injected() {
+    // Its own output name: the other static tests build `hooks_static` in parallel.
+    let hooks = build_c_named(
+        "hooks_static.c",
+        "hooks_musl_static",
+        &["-static", "-no-pie"],
+    );
+    let path = hooks.to_str().expect("UTF-8 path");
+    let (status, log) = run_leakgc(&[path], &[("LEAKGC_LOG", "1")]);
+
+    assert_eq!(status.code(), Some(0), "log:\n{log}");
+    assert!(
+        log.contains("the allocator's internal functions have no symbol table entries"),
+        "log:\n{log}"
+    );
+    assert!(!log.contains("by injected free calls"), "log:\n{log}");
+    assert!(log.contains("1 blocks, 200 bytes"), "log:\n{log}");
+    assert!(log.contains("1 blocks, 40000 bytes"), "log:\n{log}");
 }
 
 #[test]

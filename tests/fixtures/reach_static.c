@@ -2,6 +2,9 @@
 #include <sys/mman.h>
 
 void *kept;
+/* Referenced, never called. A static musl binary links realloc only when
+   something refers to it, and the reachability check needs realloc hooked (D79). */
+void *(*realloc_ref)(void *, size_t) = realloc;
 
 int main(void) {
     void *local = malloc(555);
