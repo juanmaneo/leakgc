@@ -477,6 +477,32 @@ Built in the commit that adds this section. The gates pass: `cargo fmt --all -- 
 - **Network from containers.** Reachable: `github.com`, `dl-cdn.alpinelinux.org`, `static.rust-lang.org`, `index.crates.io` and `gitlab.redox-os.org` (relibc source). Not reachable, from the host and from containers: `cosmo.zip`, which publishes the Cosmopolitan toolchain (`cosmocc`). Timed out after 90 s.
 - **Local libcs.** The host has `musl-gcc` (musl 1.2.6) and the glibc install. Cosmopolitan is not installed. relibc was built once before, in `spikes/relibc`, on `nightly-2026-05-24` with `-Z build-std`.
 
+## 7q. Docker test matrix: glibc green, musl red (results)
+
+- **Commits.** `955076c` makes the real-process tests hermetic and portable (D76 to D78). `5414701` adds `Dockerfile.libc` and `scripts/libc-tests.sh` (D73).
+- **glibc passes.** `scripts/libc-tests.sh glibc` runs the full workspace suite in the `gcc:16` image with Rust 1.100.0: 31 test binaries, no failures. The host gate also passes: `cargo fmt --check`, `cargo test --workspace --locked`, `cargo xtask lint`, and `cargo xtask coverage` (23 source files at 100%).
+- **A coverage gap was found and fixed.** With the cleared environment from D76, the `LEAKGC_LOG` branch in `supervisor::supervise` (`src/supervisor.rs` line 512) had no counts. cargo-llvm-cov sets `LLVM_PROFILE_FILE`, and the cleared environment dropped it, so the binary wrote no counters for those runs. `run_leakgc` now forwards that one variable. `cargo xtask coverage` failed on this before the fix and passes after it.
+- **musl is red: 114 failing tests in seven binaries.** The musl image is Alpine 3.20 with GCC 13.2.1. The glibc image has GCC 16. Binary layout and block counts differ between the two images.
+
+| Test binary | Failing tests |
+| --- | --- |
+| crash | 3 |
+| hook_glibc | 1 |
+| install_fake | 21 |
+| install_real | 1 |
+| monitor_fake | 71 |
+| supervisor_fake | 8 |
+| supervisor_real | 9 |
+
+Causes, from the panic messages and the log lines. Not every failing test was traced to its own line.
+
+1. **A static musl program can never have all ten hooks (product).** `install_core` requires every entry in `HOOKS`. musl has no `pvalloc` and no `malloc_trim`. The fixture fails to link with `undefined reference to pvalloc`. A static musl program that never calls `calloc` or `realloc` has no such entry, so the install returns `MissingSymbol("calloc")`. The log says `not covered: MissingSymbol(...)`. This is an explicit refusal, not a silent miss. Most failures in `install_fake`, `monitor_fake` and `supervisor_fake` come from it.
+2. **musl dynamic programs are never hooked (product).** `C_LIBRARY` in `src/install.rs` is `libc.so.6`. musl's soname is `libc.musl-x86_64.so.1`. The log says `the C library was never mapped, so no hooks were installed: not covered`. This fails the dynamic and PIE reports in `supervisor_real`.
+3. **Fixtures use glibc-only functions (test).** `posix_static.c` calls `malloc_trim`, `allocators_static.c` calls `pvalloc`, and `leak_free_static.c` reads `mallinfo2()`, which musl does not declare. These fail to build, so the tests built on them fail in `supervisor_real`.
+4. **Tests expect glibc internal names (test and product).** `crash.rs` and the internals tests in `install_fake` use `_int_malloc`, which musl does not have. Without internal names, `allocator_internals` returns None, and R37 refuses every injection. That is the safe default (D71), so no free is wrong, but musl gets no frees.
+
+What musl still needs: a musl soname in the installer, a per-libc hook list that separates required entries from optional ones (D79), and glibc-only tests gated or rewritten. None of this is built.
+
 ## 8. Risks (stated plainly)
 
 **Central safety assumption (D41).** leakgc frees for real using a conservative scan, so it makes the same bet as any conservative collector (Boehm): a program that hides pointers can be crashed by a wrong free. R2 and R3 are therefore the headline risks, not ordinary ones, and always-on quarantine (P5) is the primary safeguard. Everything else below is secondary to the rule: never free a block that is still in use.
@@ -604,10 +630,15 @@ Key: **DECIDED** means chosen or confirmed by the user. **SUPERSEDED** means rep
 - **D69 Dynamic and PIE hooks (step 1). DECIDED (user: "do all the steps starting with 1"). Built (7o).** A dynamic or PIE program is hooked through its C library once that library is mapped, at the first trapped `mmap` exit after the mapping. A thread started before that cancels the wait, and the process is reported as not covered.
 - **D70 Quarantine only when an injected free can follow (step 1). DECIDED (implementation; not confirmed by the user).** Unreached blocks are poisoned only when XSAVE is present and the internal allocator names were found. Otherwise the program's memory is not changed. This is a behaviour change for stripped libraries, which are now not poisoned. Flagged for the user's review.
 - **D72 libc-agnostic support (user: "you should be lib c agnostic and support more than one: glibc, musl libc and cosmopolitan libc"). DECIDED (scope). Not built.** leakgc supports glibc, musl and Cosmopolitan. Each family needs its own entry-point and internal-name handling, and its own test target. D20 is amended to match. Nothing here is verified yet, including how each family's allocator is found in a binary and whether Cosmopolitan's APE format runs under the supervisor.
-- **D73 Tests run in Docker (user: "use docker for all those tests"). DECIDED (environment). Probed in 7p.** The libc test matrix runs in containers. ptrace works in a default container (7p). The existing `Dockerfile` (Fedora) is the development image and is not yet used for the libc matrix.
+- **D73 Tests run in Docker (user: "use docker for all those tests"). DECIDED (environment). Probed in 7p.** The libc test matrix runs in containers. ptrace works in a default container (7p). The libc matrix runs from `Dockerfile.libc` (commit `5414701`). The existing `Dockerfile` (Fedora) is the development image.
 - **D74 relibc as a beta feature (user: "add a beta feature to use relibc (libc in Rust from Redox OS)"). DECIDED (scope). Not built.** relibc is an opt-in beta, not the default. D13 (test only) is superseded for this purpose. The source is reachable from containers (7p). The exact opt-in switch and what "beta" promises are not decided yet.
 - **D75 Cosmopolitan toolchain source. OPEN (needs the user's answer).** `cosmo.zip` is not reachable from the host or from containers (7p), and the Cosmopolitan build needs `cosmocc`. Options: (a) you place `cosmocc.zip` in a directory the test images can read, (b) you allow network access to `cosmo.zip` for the image build, or (c) we find a route from the GitHub source (not verified).
 - **D71 Source of the C library's internal names. OPEN (needs the user's answer).** Freeing in a dynamic program needs `_int_malloc` and the other internal allocator functions by name. A stripped system C library does not have them. Options: (a) install the distribution's debug package for this exact C library build; (b) look up the debug file by build ID under `/usr/lib/debug/.build-id/`, as gdb does; (c) keep a reviewed table of internal offsets per C library build ID. Until this is decided, dynamic programs are hooked and reported, but not freed. The R37 rule stays as it is, so an unknown build is never injected into.
+
+- **D76 Tests run leakgc with a cleared environment. DECIDED (implementation; not confirmed by the user). Built in `955076c` (7q).** `cargo test` sets `LD_LIBRARY_PATH` for test processes. A static glibc image reads it at startup and allocates for it, which changed the traced block counts and the reachability results. `run_leakgc` therefore clears the environment and forwards only `LLVM_PROFILE_FILE`, which cargo-llvm-cov needs. The product is not changed.
+- **D77 R37 can refuse a safe injection because of stale stack words. DECIDED (implementation; not confirmed by the user). Observed in the container (7q).** R37 refuses an injected free if any of the top 128 stack words points into allocator internals. Startup can leave stale return addresses in `main`'s frame, so a real program can lose frees this way. The rule is conservative and depends on the libc build. This is a real cost: a legitimate free is skipped. The test fixtures clear that window instead. The rule itself is unchanged, and the user should know it affects real programs, not only tests.
+- **D78 Docker's default seccomp profile makes clone3 fail. DECIDED (implementation; not confirmed by the user). Built in `955076c` (7q).** The profile returns ENOSYS for clone3, so glibc falls back to clone. The threaded test accepts either call, since both start a thread. The trap list already includes both calls (`src/trap.rs`).
+- **D79 Static binaries with some allocator entries missing. OPEN (needs the user's answer). Not verified.** A static binary that never links an entry cannot call it through the linker, so the install could skip that entry instead of refusing the whole program. Adopting this needs proof that every allocation in the binary reaches one of the hooked entries. Without that proof the install keeps refusing, which is safe but gives static musl programs no coverage (7q). Options: (a) keep refusing; (b) skip missing optional entries once the proof exists; (c) define the required entries per C library. No code is written for this.
 
 ## 10. Acknowledgements (finalised in P8, see `ACKNOWLEDGEMENTS.md`)
 
