@@ -6,6 +6,7 @@
 #
 #   scripts/libc-tests.sh glibc
 #   scripts/libc-tests.sh musl
+#   scripts/libc-tests.sh cosmo
 #
 # Plain Dockerfile syntax only, so `docker build` and `podman build` both work.
 
@@ -33,3 +34,32 @@ ENV PATH="/root/.cargo/bin:${PATH}" \
     CARGO_TARGET_DIR="/cargo-target"
 WORKDIR /workspace
 CMD ["cargo", "test", "--workspace", "--locked", "--no-fail-fast"]
+
+# Cosmopolitan Libc (PLAN D72, D75). The toolchain comes from the GitHub release,
+# pinned by its SHA-256. Its tools are APE files, so they run through the shim
+# in scripts/cosmo-shim.sh (D85). The cosmo tests are ignored by `cargo test`,
+# so this image runs only them.
+FROM gcc:16 AS cosmo
+ARG RUST_TOOLCHAIN
+ARG COSMOCC_SHA256=85b8c37a406d862e656ad4ec14be9f6ce474c1b436b9615e91a55208aced3f44
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends unzip \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -sSfL -o /tmp/cosmocc.zip \
+      https://github.com/jart/cosmopolitan/releases/download/4.0.2/cosmocc-4.0.2.zip \
+    && echo "${COSMOCC_SHA256}  /tmp/cosmocc.zip" | sha256sum -c - \
+    && unzip -q /tmp/cosmocc.zip -d /opt/cosmocc \
+    && rm /tmp/cosmocc.zip
+COPY scripts/cosmo-shim.sh /usr/local/bin/cosmo-shim.sh
+RUN sh /usr/local/bin/cosmo-shim.sh /opt/cosmocc \
+    && /opt/cosmocc/bin/cosmocc --version
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --no-modify-path --profile minimal \
+      --default-toolchain "${RUST_TOOLCHAIN}"
+# cosmocc goes last so that `cc`, which Rust's linker and the other tests use,
+# stays the system compiler. Cosmopolitan's own tools are named with a target prefix.
+ENV PATH="/root/.cargo/bin:${PATH}:/opt/cosmocc/bin" \
+    CARGO_TARGET_DIR="/cargo-target"
+WORKDIR /workspace
+CMD ["cargo", "test", "--locked", "--test", "libc_cosmo", "--", "--ignored"]
