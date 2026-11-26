@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use leakgc::ledger::{ImageReport, Ledger, Reachability, Site};
+use leakgc::ledger::{ImageReport, Ledger, Reachability, Site, released};
 use leakgc::ring::{Kind, Record};
 
 const A: u64 = 0xa;
@@ -366,4 +366,44 @@ fn a_report_whose_check_failed_claims_nothing_and_gives_the_reason() {
             "  caller 0xa: 1 blocks, 16 bytes",
         ]
     );
+}
+
+#[test]
+fn a_free_releases_its_argument_unless_it_is_null() {
+    assert_eq!(released(&free(A, 0x1000)), Some(0x1000));
+    assert_eq!(released(&free(A, 0)), None);
+}
+
+#[test]
+fn a_successful_realloc_releases_its_old_pointer() {
+    assert_eq!(released(&realloc(A, 0x1000, 32, 0x2000)), Some(0x1000));
+    assert_eq!(released(&realloc(A, 0, 32, 0x2000)), None);
+}
+
+#[test]
+fn a_failed_realloc_keeps_its_old_pointer() {
+    assert_eq!(released(&realloc(A, 0x1000, 32, 0)), None);
+}
+
+#[test]
+fn a_realloc_to_size_zero_releases_its_old_pointer_even_when_it_returns_null() {
+    assert_eq!(released(&realloc(A, 0x1000, 0, 0)), Some(0x1000));
+}
+
+#[test]
+fn only_free_and_realloc_release_a_pointer() {
+    let with_arg = |kind| Record {
+        kind,
+        size: 16,
+        caller: A,
+        arg: 0x1000,
+        result: 0x2000,
+    };
+    assert_eq!(released(&with_arg(Kind::Malloc)), None);
+    assert_eq!(released(&with_arg(Kind::Calloc)), None);
+    assert_eq!(released(&with_arg(Kind::Memalign)), None);
+    assert_eq!(released(&with_arg(Kind::Valloc)), None);
+    assert_eq!(released(&with_arg(Kind::PosixMemalign)), None);
+    assert_eq!(released(&with_arg(Kind::Nested)), None);
+    assert_eq!(released(&with_arg(Kind::MallocTrim)), None);
 }

@@ -1,16 +1,19 @@
-//! Which outstanding blocks a stopped process still reaches (P4b). Report only:
-//! nothing is freed from here.
+//! Which outstanding blocks a stopped process still reaches (P4b), and which
+//! of the unreached ones may be poisoned and freed (P5). Nothing is freed from
+//! here: the quarantine decides that.
 //!
 //! The roots are the registers, every writable mapping and every readable,
-//! non-executable mapping (D51), with three exclusions. The hook region is skipped, because its records hold the
-//! pointers the ledger was built from. Outstanding blocks are skipped, so a
-//! block is kept only by something outside the heap bookkeeping, and a leaked
-//! block that points at another block does not keep it alive. Below the stack
-//! pointer only the red zone is scanned, because the rest is dead stack.
+//! non-executable mapping (D51), with three exclusions. The hook region is
+//! skipped, because its records hold the pointers the ledger was built from.
+//! Outstanding blocks are skipped, so a block is kept only by something
+//! outside the heap bookkeeping, and a leaked block that points at another
+//! block does not keep it alive. Below the stack pointer only the red zone is
+//! scanned, because the rest is dead stack.
 //!
-//! Caveats, before any freeing (P5): words are read at 8-byte alignment, so a
-//! pointer at an odd offset is not seen. A block whose memory is not inside
-//! one writable mapping is never read, so it is never a source of references.
+//! Caveats (R3): words are read at 8-byte alignment, so a pointer at an odd
+//! offset is not seen, and its block can be held or freed wrongly. A block
+//! whose memory is not inside one writable mapping is never read, so it is
+//! never a source of references.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -28,6 +31,16 @@ const RED_ZONE: u64 = 128;
 /// The most bytes read in one request, so a large mapping is read in pieces.
 const CHUNK: u64 = 64 * 1024;
 
+/// What one scan found, from [`reachable`].
+#[derive(Debug, PartialEq, Eq)]
+pub struct Scan {
+    /// The start of every block that a root or another reached block points into.
+    pub reached: BTreeSet<u64>,
+    /// The start of every block whose span (at least one byte) lies in one
+    /// private writable mapping. Only these may be poisoned or freed (D41).
+    pub freeable: BTreeSet<u64>,
+}
+
 /// The start addresses of the blocks that a root or a reached block points into.
 /// `blocks` holds `(start, size)` pairs of outstanding blocks and may be in any
 /// order. `hook` is the hook region, which is never read. Returns `Err` with a
@@ -37,7 +50,7 @@ pub fn reachable<T: Tracer>(
     pid: Pid,
     hook: Range<u64>,
     blocks: &[(u64, u64)],
-) -> Result<BTreeSet<u64>, String> {
+) -> Result<Scan, String> {
     let maps = tracer
         .read_maps(pid)
         .map_err(|error| format!("cannot read the memory map: {error}"))?;
@@ -46,6 +59,8 @@ pub fn reachable<T: Tracer>(
         .ok_or("the memory map cannot be parsed")?;
     let mut writable = ranges.writable;
     writable.sort_unstable();
+    let mut private = ranges.private;
+    private.sort_unstable();
     let regs = tracer
         .regs(pid)
         .map_err(|error| format!("cannot read the registers: {error}"))?;
@@ -86,7 +101,14 @@ pub fn reachable<T: Tracer>(
             words: block_words(tracer, pid, &writable, start, size),
         })
         .collect();
-    mark(&roots, &objects).map_err(|_| "a reached block could not be read".to_string())
+    let reached =
+        mark(&roots, &objects).map_err(|_| "a reached block could not be read".to_string())?;
+    let freeable = blocks
+        .iter()
+        .filter(|&&(start, size)| within(&private, start, start.saturating_add(size.max(1))))
+        .map(|&(start, _)| start)
+        .collect();
+    Ok(Scan { reached, freeable })
 }
 
 /// Every register field that can hold a pointer: all 27 of `user_regs_struct`.
@@ -174,6 +196,12 @@ fn coalesce(sorted: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
     out
 }
 
+/// Whether `[start, end)` lies inside one of the sorted, disjoint `mappings`.
+fn within(mappings: &[(u64, u64)], start: u64, end: u64) -> bool {
+    let index = mappings.partition_point(|&(s, _)| s <= start);
+    index > 0 && end <= mappings[index - 1].1
+}
+
 /// The words of one block, read only when the whole block lies in one writable
 /// mapping. Any other block is unreadable, so it is never trusted as a source
 /// of references.
@@ -188,9 +216,7 @@ fn block_words<T: Tracer>(
     if len == 0 {
         return Words::Read(Vec::new());
     }
-    let end = start.saturating_add(len);
-    let index = writable.partition_point(|&(s, _)| s <= start);
-    if index == 0 || end > writable[index - 1].1 {
+    if !within(writable, start, start.saturating_add(len)) {
         return Words::Unreadable;
     }
     match words(tracer, pid, start, len) {

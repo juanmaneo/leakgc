@@ -13,8 +13,10 @@
 //! - [`install`] injects the memory and writes the patches into a stopped
 //!   static process through the [`supervisor::Tracer`] trait.
 //! - [`ledger`] turns finished calls into the blocks an image still holds,
-//!   [`reach`] tells which of them a stopped process still reaches (report
-//!   only), and [`monitor`] keeps one ledger per traced process.
+//!   [`reach`] tells which of them a stopped process still reaches, and
+//!   [`monitor`] keeps one ledger per traced process.
+//! - [`quarantine`] holds the unreached blocks and poisons them, so that a
+//!   free is only ever made after a full scan cycle (P5).
 
 #[cfg(not(target_arch = "x86_64"))]
 compile_error!("leakgc's trap filter and register access are x86_64-only");
@@ -26,6 +28,7 @@ pub mod install;
 pub mod ledger;
 pub mod maps;
 pub mod monitor;
+pub mod quarantine;
 pub mod reach;
 pub mod ring;
 pub mod stub;

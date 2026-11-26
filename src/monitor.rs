@@ -4,8 +4,9 @@
 //! Records written after a process's last trapped call are never read (D34).
 //! Once a process has made `COLLECT_EVERY` allocations since its last check,
 //! its next trapped call checks it for reachability. Each fork is checked
-//! whatever the count (D42, D47, D53). A check is reported and never acted on
-//! (P4b). Threads are not handled yet: the first clone that shares memory
+//! whatever the count (D42, D47, D53). A check also holds the unreached blocks
+//! in quarantine, which poisons them (P5). Freeing is not built yet. Threads
+//! are not handled yet: the first clone that shares memory
 //! removes the hooks from that process, and its reachability checks end for
 //! good (P2b-3b).
 
@@ -18,7 +19,8 @@ use nix::unistd::Pid;
 use crate::install::{
     HEAD_OFFSET, Installed, RECORDS_OFFSET, REGION_LEN, install_hooks, uninstall,
 };
-use crate::ledger::{ImageReport, Ledger, Reachability};
+use crate::ledger::{ImageReport, Ledger, Reachability, released};
+use crate::quarantine::Quarantine;
 use crate::reach::reachable;
 use crate::ring::{Kind, RECORD_LEN, Slot, decode, plan_drain, slot_runs};
 use crate::supervisor::Tracer;
@@ -57,6 +59,8 @@ struct Process {
     reach: Reachability,
     /// Allocations applied since the last completed check (D53).
     allocations_since_check: u64,
+    /// Unreached blocks held and poisoned at a check (P5).
+    quarantine: Quarantine,
 }
 
 impl Process {
@@ -70,6 +74,7 @@ impl Process {
             untrusted: None,
             reach: Reachability::Unchecked,
             allocations_since_check: 0,
+            quarantine: Quarantine::default(),
         }
     }
 
@@ -126,6 +131,12 @@ impl Process {
                         break 'runs;
                     }
                     Some(Slot::Done(record)) => {
+                        if let Some(ptr) = released(&record)
+                            && let Some(reason) = self.quarantine.released(ptr)
+                        {
+                            self.notes.push(format!("{reason}: counts are incomplete"));
+                            self.untrusted.get_or_insert(reason);
+                        }
                         self.ledger.apply(record);
                         if record.kind == Kind::Nested {
                             let reason = format!(
@@ -173,8 +184,14 @@ impl Process {
                 let blocks: Vec<(u64, u64)> = self.ledger.live_blocks().collect();
                 let region = hook.base..hook.base + REGION_LEN;
                 self.reach = match reachable(tracer, pid, region, &blocks) {
-                    Ok(reached) => Reachability::Checked {
-                        lost: self.ledger.unreached_sites(&reached),
+                    Ok(scan) => match self.quarantine.update(tracer, pid, &blocks, &scan) {
+                        Ok(()) => Reachability::Checked {
+                            lost: self.ledger.unreached_sites(&scan.reached),
+                        },
+                        Err(reason) => {
+                            self.untrusted.get_or_insert(reason.clone());
+                            Reachability::Incomplete(reason)
+                        }
                     },
                     Err(reason) => Reachability::Incomplete(reason),
                 };

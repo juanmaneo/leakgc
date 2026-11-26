@@ -30,7 +30,7 @@ fn scene() -> Fake {
 }
 
 fn scan(fake: &mut Fake, blocks: &[(u64, u64)]) -> Result<BTreeSet<u64>, String> {
-    reachable(fake, pid(), FAR_HOOK, blocks)
+    reachable(fake, pid(), FAR_HOOK, blocks).map(|scan| scan.reached)
 }
 
 fn reached(fake: &mut Fake, blocks: &[(u64, u64)]) -> Vec<u64> {
@@ -154,7 +154,7 @@ fn a_hook_region_is_never_read() {
     put_word(&mut fake, RSP + 0x100, X);
 
     assert_eq!(
-        reachable(&mut fake, pid(), 0x1000_0000..0x1000_1000, &[(X, 16)]),
+        reachable(&mut fake, pid(), 0x1000_0000..0x1000_1000, &[(X, 16)]).map(|scan| scan.reached),
         Ok(BTreeSet::from([X]))
     );
 }
@@ -179,7 +179,8 @@ fn the_hook_region_excludes_its_bytes_wherever_it_lies_relative_to_the_heap() {
             put_word(&mut fake, at, X);
         }
 
-        let kept = reachable(&mut fake, pid(), hook.clone(), &[(X, 16), (Y, 16)]);
+        let kept =
+            reachable(&mut fake, pid(), hook.clone(), &[(X, 16), (Y, 16)]).map(|scan| scan.reached);
         let kept = kept.expect("the hook region is not read");
         assert!(kept.contains(&Y), "hook {hook:x?}");
         assert!(!kept.contains(&X), "hook {hook:x?}");
@@ -196,7 +197,8 @@ fn words_on_both_sides_of_a_hole_in_the_heap_are_scanned() {
     let hole = 0x6000_1000..0x6000_2000;
 
     let kept = reachable(&mut fake, pid(), hole, &[(X, 16), (Y, 16), (Z, 16)])
-        .expect("the scan completes");
+        .expect("the scan completes")
+        .reached;
 
     assert_eq!(kept, BTreeSet::from([Y, Z]));
 }
@@ -209,7 +211,8 @@ fn a_block_touching_the_hook_region_is_excluded_with_it() {
     let hook = 0x6000_0000..0x6000_1000;
 
     let kept = reachable(&mut fake, pid(), hook, &[(0x6000_1000, 16), (X, 16)])
-        .expect("the scan completes");
+        .expect("the scan completes")
+        .reached;
 
     assert_eq!(kept, BTreeSet::from([0x6000_1000]));
 }
@@ -379,4 +382,50 @@ fn overlapping_or_duplicate_blocks_are_an_error() {
             "{blocks:?}"
         );
     }
+}
+
+const SHARED: (u64, u64) = (0x6200_0000, 0x6200_1000);
+
+fn freeable(fake: &mut Fake, blocks: &[(u64, u64)]) -> BTreeSet<u64> {
+    reachable(fake, pid(), FAR_HOOK, blocks)
+        .expect("scan completes")
+        .freeable
+}
+
+#[test]
+fn a_block_inside_a_private_writable_mapping_is_freeable() {
+    let mut fake = scene();
+    let blocks = [(X, 16), (BLOCKS.1 - 16, 16), (HEAP.0 + 0x100, 0)];
+
+    assert_eq!(
+        freeable(&mut fake, &blocks),
+        BTreeSet::from([X, BLOCKS.1 - 16, HEAP.0 + 0x100])
+    );
+}
+
+#[test]
+fn a_block_that_crosses_the_end_of_its_mapping_is_not_freeable() {
+    let mut fake = scene();
+
+    assert_eq!(freeable(&mut fake, &[(BLOCKS.1 - 8, 16)]), BTreeSet::new());
+}
+
+#[test]
+fn a_zero_size_block_is_freeable_only_if_its_one_byte_lies_inside() {
+    let mut fake = scene();
+
+    assert_eq!(
+        freeable(&mut fake, &[(BLOCKS.1 - 1, 0), (BLOCKS.1, 0)]),
+        BTreeSet::from([BLOCKS.1 - 1])
+    );
+}
+
+#[test]
+fn a_block_in_a_shared_read_only_or_unmapped_range_is_not_freeable() {
+    let mut fake = scene();
+    filled_mapping(&mut fake, SHARED.0, SHARED.1, "rw-s");
+    filled_mapping(&mut fake, READ_ONLY.0, READ_ONLY.1, "r--p");
+    let blocks = [(SHARED.0, 16), (READ_ONLY.0, 16), (0x4000_0000, 16)];
+
+    assert_eq!(freeable(&mut fake, &blocks), BTreeSet::new());
 }

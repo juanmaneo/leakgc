@@ -10,6 +10,7 @@ use common::*;
 use leakgc::install::{DEFAULT_HINT, HEAD_OFFSET, RECORDS_OFFSET, REGION_LEN};
 use leakgc::ledger::{ImageReport, Reachability, Site};
 use leakgc::monitor::Monitor;
+use leakgc::quarantine::POISON;
 use leakgc::ring::{CAPACITY, Kind, RECORD_LEN, Record};
 use nix::unistd::Pid;
 
@@ -845,4 +846,83 @@ fn a_shared_clone_in_an_image_that_is_not_hooked_changes_nothing() {
     let report = only(monitor.finish());
     assert_eq!(report.reachability, Reachability::Unchecked);
     assert_eq!(report.notes.len(), 2, "{:?}", report.notes);
+}
+
+fn free_record(ptr: u64) -> Record {
+    Record {
+        kind: Kind::Free,
+        size: 0,
+        caller: CALLER,
+        arg: ptr,
+        result: 0,
+    }
+}
+
+/// A process with a live block at 0x7000 and an unreached block at 0x8000,
+/// which the first check holds in quarantine.
+fn with_a_held_block() -> Hooked {
+    let mut h = hooked();
+    map_writable(&mut h.fake, 0x7000, 0x9000);
+    set_head(&mut h.fake, 2);
+    write_slot(&mut h.fake, 0, malloc_record(16, 0x7000), true);
+    write_slot(&mut h.fake, 1, malloc_record(32, 0x8000), true);
+    put_word(&mut h.fake, RSP + 0x100, 0x7000);
+    h
+}
+
+#[test]
+fn a_check_poisons_the_unreached_block_it_holds() {
+    let mut h = with_a_held_block();
+
+    h.monitor.trapped(&mut h.fake, pid(), None);
+
+    assert_eq!(h.fake.bytes(0x8000, 32), vec![POISON; 32]);
+    let report = only(h.monitor.finish());
+    assert_eq!(
+        report.reachability,
+        Reachability::Checked {
+            lost: vec![Site {
+                caller: CALLER,
+                blocks: 1,
+                bytes: 32
+            }]
+        }
+    );
+}
+
+#[test]
+fn a_free_of_a_held_block_makes_every_later_check_incomplete() {
+    let mut h = with_a_held_block();
+    h.monitor.trapped(&mut h.fake, pid(), None);
+    set_head(&mut h.fake, 3);
+    write_slot(&mut h.fake, 2, free_record(0x8000), true);
+
+    h.monitor.trapped(&mut h.fake, pid(), None);
+
+    let report = only(h.monitor.finish());
+    assert_eq!(
+        report.reachability,
+        Reachability::Incomplete(
+            "a held block at 0x8000 was freed: the scan missed a reference to it (R2)".to_string()
+        )
+    );
+    assert!(has_note(&report, "a held block at 0x8000 was freed"));
+}
+
+#[test]
+fn a_block_that_cannot_be_poisoned_makes_the_process_untrusted() {
+    let mut h = with_a_held_block();
+    h.fake.fail_writes = true;
+    h.monitor.trapped(&mut h.fake, pid(), None);
+    h.fake.fail_writes = false;
+
+    h.monitor.trapped(&mut h.fake, pid(), None);
+
+    let report = only(h.monitor.finish());
+    assert_eq!(
+        report.reachability,
+        Reachability::Incomplete(
+            "a block at 0x8000 could not be poisoned: injected write failure".to_string()
+        )
+    );
 }

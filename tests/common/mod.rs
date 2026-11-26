@@ -91,6 +91,8 @@ pub struct Fake {
     pub step_results: VecDeque<nix::Result<()>>,
     pub single_step_results: VecDeque<nix::Result<bool>>,
     pub fail_at: Option<usize>,
+    /// Makes every `write_mem` fail, without counting toward `fail_at`.
+    pub fail_writes: bool,
     pub calls: usize,
     pub writes: Vec<(u64, Vec<u8>)>,
     pub maps: String,
@@ -125,6 +127,7 @@ impl Fake {
             step_results: VecDeque::new(),
             single_step_results: VecDeque::new(),
             fail_at: None,
+            fail_writes: false,
             calls: 0,
             writes: Vec::new(),
             maps: String::new(),
@@ -260,7 +263,7 @@ impl Tracer for Fake {
     }
 
     fn write_mem(&mut self, _pid: Pid, addr: u64, bytes: &[u8]) -> io::Result<()> {
-        if self.fails() {
+        if self.fail_writes || self.fails() {
             return Err(io::Error::other("injected write failure"));
         }
         self.poke(addr, bytes);

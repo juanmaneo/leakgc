@@ -30,9 +30,31 @@ pub struct Site {
     pub bytes: u64,
 }
 
+/// The pointer that a finished call gives back to the process, if any. A
+/// failed realloc leaves its argument valid, and a null argument releases nothing.
+pub fn released(record: &Record) -> Option<u64> {
+    let ptr = match record.kind {
+        Kind::Free => record.arg,
+        // Size zero frees the argument, so only a failed call is excluded.
+        Kind::Realloc if record.result == 0 && record.size != 0 => return None,
+        Kind::Realloc => record.arg,
+        Kind::Malloc
+        | Kind::Memalign
+        | Kind::Valloc
+        | Kind::PosixMemalign
+        | Kind::Calloc
+        | Kind::Nested
+        | Kind::MallocTrim => return None,
+    };
+    (ptr != 0).then_some(ptr)
+}
+
 impl Ledger {
     /// Applies one finished call, in the order the process made it.
     pub fn apply(&mut self, record: Record) {
+        if let Some(ptr) = released(&record) {
+            self.release(ptr);
+        }
         match record.kind {
             Kind::Malloc | Kind::Memalign | Kind::Valloc | Kind::PosixMemalign => {
                 self.insert(record)
@@ -43,23 +65,10 @@ impl Ledger {
                 size: record.size.wrapping_mul(record.arg),
                 ..record
             }),
-            Kind::Free => {
-                if record.arg != 0 {
-                    self.release(record.arg);
-                }
-            }
-            Kind::Realloc => {
-                // A failed realloc leaves its argument valid. Size zero frees it.
-                if record.result == 0 && record.size != 0 {
-                    return;
-                }
-                if record.arg != 0 {
-                    self.release(record.arg);
-                }
-                self.insert(record);
-            }
+            // A failed realloc returns NULL, which `insert` ignores.
+            Kind::Realloc => self.insert(record),
             // Hold no block. A nested call also makes the monitor mark the ledger untrusted (R40).
-            Kind::Nested | Kind::MallocTrim => {}
+            Kind::Free | Kind::Nested | Kind::MallocTrim => {}
         }
     }
 

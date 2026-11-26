@@ -20,6 +20,9 @@ pub fn writable_count(maps: &str) -> usize {
 pub struct ScanRanges {
     /// The writable mappings. A block's contents are read only inside one of them (D44).
     pub writable: Vec<(u64, u64)>,
+    /// The writable mappings that are private, not shared with another process.
+    /// Only a block inside one of them may be poisoned or freed (D41).
+    pub private: Vec<(u64, u64)>,
     /// The roots: the writable mappings and the readable, non-executable
     /// mappings (D51). The kernel's `[vvar]` pages are left out. They cannot be
     /// read, and they hold no pointers of the process.
@@ -46,6 +49,9 @@ pub fn scan_ranges(maps: &str) -> Option<ScanRanges> {
         let executable = perms.get(2) == Some(&b'x');
         if writable {
             ranges.writable.push((start, end));
+            if perms.get(3) == Some(&b'p') {
+                ranges.private.push((start, end));
+            }
         }
         if writable || (readable && !executable && !path.starts_with("[vvar")) {
             ranges.roots.push((start, end));
