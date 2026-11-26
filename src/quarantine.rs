@@ -52,6 +52,16 @@ impl Quarantine {
         self.held.remove(&start);
     }
 
+    /// Checks that the held block at `start` still reads as poison over its
+    /// whole span. It runs just before the block's injected free (R42), so a
+    /// block that the program changed or unmapped since it was held is not freed.
+    pub fn verify<T: Tracer>(&self, tracer: &mut T, pid: Pid, start: u64) -> Result<(), String> {
+        let Some(held) = self.held.get(&start) else {
+            return Err(format!("a block at 0x{start:x} is not held"));
+        };
+        check_poison(tracer, pid, start, held.size)
+    }
+
     /// The `(start, size)` of every block that has survived a full cycle, in address order.
     pub fn confirmed(&self) -> Vec<(u64, u64)> {
         self.held
@@ -84,19 +94,8 @@ impl Quarantine {
                     "a held block at 0x{start:x} is no longer outstanding at its size"
                 ));
             }
-            match unchanged(tracer, pid, start, held.size) {
-                Ok(true) => held.confirmed = true,
-                Ok(false) => {
-                    return Err(format!(
-                        "a held block at 0x{start:x} was written to: the program used a block the scan missed (R2)"
-                    ));
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "a held block at 0x{start:x} could not be read: {error}"
-                    ));
-                }
-            }
+            check_poison(tracer, pid, start, held.size)?;
+            held.confirmed = true;
         }
         for &(start, size) in blocks {
             if scan.reached.contains(&start)
@@ -127,6 +126,19 @@ fn pieces(start: u64, size: u64) -> impl Iterator<Item = (u64, usize)> {
     (start..end)
         .step_by(CHUNK as usize)
         .map(move |at| (at, (end - at).min(CHUNK) as usize))
+}
+
+/// Checks that the span of a held block still reads as poison, and says why not.
+fn check_poison<T: Tracer>(tracer: &mut T, pid: Pid, start: u64, size: u64) -> Result<(), String> {
+    match unchanged(tracer, pid, start, size) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!(
+            "a held block at 0x{start:x} was written to: the program used a block the scan missed (R2)"
+        )),
+        Err(error) => Err(format!(
+            "a held block at 0x{start:x} could not be read: {error}"
+        )),
+    }
 }
 
 /// Whether every byte of the block's span still holds `POISON`.

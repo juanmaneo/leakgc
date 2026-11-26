@@ -1314,3 +1314,105 @@ fn a_stop_that_is_not_an_injection_is_left_to_the_supervisor() {
     assert_eq!(signal_stop(&mut h, Signal::SIGTRAP), None);
     assert_eq!(signal_stop(&mut h, Signal::SIGCHLD), None);
 }
+
+#[test]
+fn a_block_changed_before_its_injected_free_is_not_freed() {
+    let mut h = confirmed_held();
+    h.fake.poke(0x8000, &[0x42]);
+    let before = h.fake.regs;
+
+    h.monitor.syscall_exited(&mut h.fake, pid());
+
+    assert_eq!(h.fake.regs, before, "nothing is injected");
+    assert!(h.fake.signals.is_empty());
+    let report = only(h.monitor.finish());
+    assert_eq!(
+        report.reachability,
+        Reachability::Incomplete(
+            "a held block at 0x8000 was written to: the program used a block the scan missed (R2)"
+                .to_string()
+        )
+    );
+    assert!(has_note(&report, "a held block at 0x8000 was written to"));
+}
+
+#[test]
+fn a_block_unmapped_before_its_injected_free_is_not_freed() {
+    let mut h = confirmed_held();
+    for addr in 0x8000..0x8020 {
+        h.fake.mem.remove(&addr);
+    }
+    let before = h.fake.regs;
+
+    h.monitor.syscall_exited(&mut h.fake, pid());
+
+    assert_eq!(h.fake.regs, before, "nothing is injected");
+    assert!(h.fake.signals.is_empty());
+    let report = only(h.monitor.finish());
+    assert_eq!(
+        report.reachability,
+        Reachability::Incomplete(
+            "a held block at 0x8000 could not be read: unmapped 0x8000".to_string()
+        )
+    );
+}
+
+#[test]
+fn a_changed_block_ends_the_injection_before_the_rest_of_the_queue_is_freed() {
+    let mut h = with_two_confirmed_blocks();
+    let (_, stop) = trampoline(&h.fake);
+    let saved = h.fake.regs;
+    h.monitor.syscall_exited(&mut h.fake, pid());
+    assert_eq!(h.fake.regs.rdi, 0x8000);
+    h.fake.poke(0xa000, &[0x42]);
+
+    h.fake.regs.rip = stop + 1;
+    assert_eq!(signal_stop(&mut h, Signal::SIGTRAP), Some(vec![]));
+
+    assert_eq!(
+        h.fake.regs,
+        libc::user_regs_struct {
+            orig_rax: u64::MAX,
+            ..saved
+        }
+    );
+    assert!(h.fake.signals.is_empty());
+    let report = only(h.monitor.finish());
+    assert!(has_note(
+        &report,
+        "freed 1 unreached blocks by injected free calls"
+    ));
+    assert_eq!(
+        report.reachability,
+        Reachability::Incomplete(
+            "a held block at 0xa000 was written to: the program used a block the scan missed (R2)"
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn refused_injections_are_counted_in_one_note_at_exit() {
+    let mut h = confirmed_held();
+    let (start, _) = symbol("_int_malloc");
+    h.fake.regs.rip = start;
+    h.monitor.syscall_exited(&mut h.fake, pid());
+    for _ in 0..2 {
+        assert!(h.monitor.trapped(&mut h.fake, pid(), Some(libc::SYS_mmap)));
+        h.monitor.syscall_exited(&mut h.fake, pid());
+    }
+
+    assert!(h.fake.signals.is_empty());
+    let report = only(h.monitor.finish());
+    assert!(has_note(&report, "3 blocks were not freed by injection"));
+    assert_eq!(
+        report
+            .notes
+            .iter()
+            .filter(|note| note.contains("were not freed by injection"))
+            .count(),
+        1,
+        "{:?}",
+        report.notes
+    );
+}

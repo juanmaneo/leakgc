@@ -250,3 +250,60 @@ fn a_block_that_cannot_be_poisoned_is_an_error_and_is_not_held() {
     );
     assert!(quarantine.released(Y).is_none());
 }
+
+#[test]
+fn verify_accepts_a_held_block_that_still_reads_as_poison() {
+    let mut fake = scene();
+    let mut quarantine = Quarantine::default();
+    update(&mut quarantine, &mut fake, &[(X, 16), (Y, 16)]).expect("the first cycle holds Y");
+
+    quarantine
+        .verify(&mut fake, pid(), Y)
+        .expect("Y is unchanged");
+}
+
+#[test]
+fn verify_rejects_a_held_block_that_was_written_to() {
+    let mut fake = scene();
+    let mut quarantine = Quarantine::default();
+    update(&mut quarantine, &mut fake, &[(X, 16), (Y, 16)]).expect("the first cycle holds Y");
+    fake.poke(Y + 15, &[0x42]);
+
+    let error = quarantine
+        .verify(&mut fake, pid(), Y)
+        .expect_err("the last byte of Y was written");
+
+    assert!(
+        error.starts_with("a held block at 0x60000100 was written to"),
+        "{error}"
+    );
+}
+
+#[test]
+fn verify_rejects_a_held_block_whose_bytes_were_unmapped() {
+    let mut fake = scene();
+    let mut quarantine = Quarantine::default();
+    update(&mut quarantine, &mut fake, &[(X, 16), (Y, 16)]).expect("the first cycle holds Y");
+    fake.mem.remove(&(Y + 4));
+
+    let error = quarantine
+        .verify(&mut fake, pid(), Y)
+        .expect_err("Y cannot be read");
+
+    assert_eq!(
+        error,
+        "a held block at 0x60000100 could not be read: unmapped 0x60000104"
+    );
+}
+
+#[test]
+fn verify_rejects_an_address_that_is_not_held() {
+    let mut fake = scene();
+    let quarantine = Quarantine::default();
+
+    let error = quarantine
+        .verify(&mut fake, pid(), Y)
+        .expect_err("nothing is held at Y");
+
+    assert_eq!(error, "a block at 0x60000100 is not held");
+}

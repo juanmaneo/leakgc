@@ -7,9 +7,9 @@
 //! whatever the count (D42, D47, D53). A check also holds the unreached blocks
 //! in quarantine, which poisons them (P5). Once a check has confirmed held
 //! blocks, the next memory call that returns frees them, one injected `free`
-//! at a time (P5). Threads are not handled yet: the first clone that shares
-//! memory removes the hooks from that process, and its reachability checks
-//! end for good (P2b-3b).
+//! at a time (P5). Each block is checked again just before its free (R42).
+//! Threads are not handled yet: the first clone that shares memory removes the
+//! hooks from that process, and its reachability checks end for good (P2b-3b).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
@@ -124,6 +124,9 @@ struct Process {
     /// Blocks that the trapped call asked to free at its exit (P5). Empty
     /// unless the call was trapped with confirmed blocks waiting.
     inject_at_exit: Vec<u64>,
+    /// Blocks whose injected free did not start, because the process was not at
+    /// a point where one is known to be safe (R37). Counted, and noted at exit.
+    skipped_frees: u64,
 }
 
 impl Process {
@@ -140,10 +143,17 @@ impl Process {
             quarantine: Quarantine::default(),
             injection: Injection::default(),
             inject_at_exit: Vec::new(),
+            skipped_frees: 0,
         }
     }
 
     fn archive(mut self, reason: String) -> ImageReport {
+        if self.skipped_frees > 0 {
+            self.notes.push(format!(
+                "{} blocks were not freed by injection: the program was not at a point where an injected free is known to be safe (R37), so they stay held",
+                self.skipped_frees
+            ));
+        }
         self.notes.push(reason);
         let mut report = ImageReport::new(self.label, &self.ledger, self.notes);
         report.reachability = self.reach;
@@ -278,36 +288,21 @@ impl Process {
 
     /// Starts an injected `free` of `blocks` at the exit of the trapped call,
     /// which is a safe point only when the R37 check allows it. Otherwise the
-    /// blocks stay held.
+    /// blocks stay held and are counted for the report.
     fn start_injection<T: Tracer>(&mut self, tracer: &mut T, pid: Pid, blocks: Vec<u64>) {
         let hook = self.hook.clone().expect("a checked process has hooks");
-        let Ok(saved) = tracer.regs(pid) else {
+        let Some(frame) = safe_frame(tracer, pid, &hook) else {
+            self.skipped_frees += blocks.len() as u64;
             return;
         };
-        let stack = read_stack(tracer, pid, saved.rsp).ok();
-        if !may_inject(
-            xsave_available(),
-            hook.internal.as_deref(),
-            saved.rip,
-            stack.as_deref(),
-        ) {
-            return;
-        }
-        let Some(rsp) = saved.rsp.checked_sub(CLEARANCE).map(|rsp| rsp & !63) else {
-            return;
-        };
-        let frame = Frame {
-            saved,
-            rsp,
-            trampoline: hook.trampoline,
-            stop: hook.stop,
-        };
-        let mut queue = VecDeque::from(blocks);
-        let first = queue.pop_front().expect("an injection has a block to free");
         self.injection = Injection {
             frame: Some(frame),
-            queue,
+            queue: VecDeque::from(blocks),
             ..Injection::default()
+        };
+        let Some(first) = self.next_block(tracer, pid) else {
+            self.injection = Injection::default();
+            return;
         };
         if let Err(error) = self.arm(tracer, pid, frame, first) {
             self.injection = Injection::default();
@@ -330,6 +325,23 @@ impl Process {
         self.quarantine.forget(block);
         self.injection.freed += 1;
         Ok(())
+    }
+
+    /// The next block to free, after its span is checked again (R42). A block
+    /// that the program changed or unmapped makes the process untrusted. The
+    /// rest of the queue then stays held, so nothing more is freed by injection.
+    fn next_block<T: Tracer>(&mut self, tracer: &mut T, pid: Pid) -> Option<u64> {
+        let block = self.injection.queue.pop_front()?;
+        let Err(reason) = self.quarantine.verify(tracer, pid, block) else {
+            return Some(block);
+        };
+        self.notes.push(format!(
+            "{reason}: this block and the rest of its queue stay held, and no more blocks are freed by injection"
+        ));
+        self.injection.queue.clear();
+        let untrusted = self.untrusted.get_or_insert(reason).clone();
+        self.reach = Reachability::Incomplete(untrusted);
+        None
     }
 
     /// A signal stopped the process while it may be running injected code.
@@ -367,7 +379,7 @@ impl Process {
                 format!("unexpected SIGTRAP at 0x{:x} in injected code", regs.rip),
             ));
         }
-        if let Some(next) = self.injection.queue.pop_front() {
+        if let Some(next) = self.next_block(tracer, pid) {
             return Some(match self.arm(tracer, pid, frame, next) {
                 Ok(()) => Vec::new(),
                 Err(error) => self.abandon(
@@ -602,6 +614,28 @@ fn is_fault(signal: Signal) -> bool {
         signal,
         Signal::SIGSEGV | Signal::SIGBUS | Signal::SIGILL | Signal::SIGFPE | Signal::SIGABRT
     )
+}
+
+/// Where an injected `free` may start, or `None` when the process is not at a
+/// point where one is known to be safe (R37). Nothing is written.
+fn safe_frame<T: Tracer>(tracer: &mut T, pid: Pid, hook: &Installed) -> Option<Frame> {
+    let saved = tracer.regs(pid).ok()?;
+    let stack = read_stack(tracer, pid, saved.rsp).ok();
+    if !may_inject(
+        xsave_available(),
+        hook.internal.as_deref(),
+        saved.rip,
+        stack.as_deref(),
+    ) {
+        return None;
+    }
+    let rsp = saved.rsp.checked_sub(CLEARANCE).map(|rsp| rsp & !63)?;
+    Some(Frame {
+        saved,
+        rsp,
+        trampoline: hook.trampoline,
+        stop: hook.stop,
+    })
 }
 
 /// The words from `rsp` upwards, which the R37 check reads.

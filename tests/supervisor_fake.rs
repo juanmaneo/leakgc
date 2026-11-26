@@ -432,11 +432,11 @@ fn churn(fake: &mut common::Fake, first: u64, base: u64, pairs: u64) {
     }
 }
 
-/// The first check holds an unreached block. The second check, at a memory
-/// call, confirms it, and its injected free runs at the exit of that call. The
-/// stop at the end of the injected code restores the registers it saved.
-#[test]
-fn a_confirmed_block_is_freed_at_the_exit_of_a_memory_call_and_the_program_resumes() {
+/// A tracer whose first check holds the unreached block at 0x8000, and whose
+/// second check, at a call of `nr`, confirms it for injection. `at_exit` runs
+/// just before the exit of that call is reported. `after_exit` are the stops
+/// that follow the exit.
+fn confirmed_block_at_call(nr: i64, at_exit: Update, after_exit: Vec<Scripted>) -> Fake {
     let mut install = common::Fake::new(
         common::static_image(),
         vec![common::trap(), common::seccomp(), common::trap()],
@@ -451,20 +451,10 @@ fn a_confirmed_block_is_freed_at_the_exit_of_a_memory_call_and_the_program_resum
     common::map_writable(&mut install, 0x7000, 0x9000);
     common::put_word(&mut install, RSP + 0x100, 0x7000);
 
-    let at_exit = Rc::new(Cell::new(None));
-    let recorder = Rc::clone(&at_exit);
-    let mut tracer = Fake::new(
-        vec![stopped(STUB, Signal::SIGSTOP)],
-        vec![
-            exec_event(STUB),
-            trap(STUB),
-            trap(STUB),
-            syscall_exit(STUB),
-            stopped(STUB, Signal::SIGTRAP),
-            exited(STUB, 0),
-        ],
-    );
-    tracer.syscall_result = Ok(libc::SYS_mmap);
+    let mut waits = vec![exec_event(STUB), trap(STUB), trap(STUB), syscall_exit(STUB)];
+    waits.extend(after_exit);
+    let mut tracer = Fake::new(vec![stopped(STUB, Signal::SIGSTOP)], waits);
+    tracer.syscall_result = Ok(nr);
     tracer.maps = Some(install.maps.clone());
     tracer.install = Some(install);
     // 66 allocations before the first trapped call, so its check holds 0x8000.
@@ -485,10 +475,22 @@ fn a_confirmed_block_is_freed_at_the_exit_of_a_memory_call_and_the_program_resum
             common::set_head(fake, 258);
         }),
     );
+    tracer.updates.insert(3, at_exit);
+    tracer
+}
+
+/// The first check holds an unreached block. The second check, at a memory
+/// call, confirms it, and its injected free runs at the exit of that call. The
+/// stop at the end of the injected code restores the registers it saved.
+#[test]
+fn a_confirmed_block_is_freed_at_the_exit_of_a_memory_call_and_the_program_resumes() {
+    let at_exit = Rc::new(Cell::new(None));
+    let recorder = Rc::clone(&at_exit);
     // The registers at the exit of the call, which the injected stop must restore.
-    tracer.updates.insert(
-        3,
+    let mut tracer = confirmed_block_at_call(
+        libc::SYS_mmap,
         Box::new(move |fake: &mut common::Fake| recorder.set(Some(fake.regs))),
+        vec![stopped(STUB, Signal::SIGTRAP), exited(STUB, 0)],
     );
     // The injected free records itself, then its trampoline reaches the int3.
     tracer.updates.insert(
@@ -522,6 +524,57 @@ fn a_confirmed_block_is_freed_at_the_exit_of_a_memory_call_and_the_program_resum
             orig_rax: u64::MAX,
             ..saved
         }
+    );
+}
+
+/// Changes the block at 0x8000 at the exit of a call, as the program would.
+/// Nothing is freed, the process is not killed, and the report says why.
+fn changed_at_exit_is_not_freed(nr: i64, change: Update, reason: &str) {
+    let mut tracer = confirmed_block_at_call(nr, change, vec![exited(STUB, 0)]);
+
+    let (code, log) = run(&mut tracer, true);
+
+    assert_eq!(code, 0);
+    assert!(!log.contains("by injected free calls"), "{log}");
+    assert!(
+        log.contains(&format!("reachability not checked: {reason}")),
+        "{log}"
+    );
+    assert!(!tracer.calls.contains(&Call::Kill(STUB, Signal::SIGKILL)));
+}
+
+/// Unmaps the pages under the block, as munmap does, or as mremap does to the
+/// range it moves away from.
+fn unmap_block(fake: &mut common::Fake) {
+    for addr in 0x8000..0x8020 {
+        fake.mem.remove(&addr);
+    }
+}
+
+#[test]
+fn a_block_mapped_over_at_the_exit_of_an_mmap_is_not_freed() {
+    changed_at_exit_is_not_freed(
+        libc::SYS_mmap,
+        Box::new(|fake: &mut common::Fake| fake.poke(0x8000, &[0; 32])),
+        "a held block at 0x8000 was written to: the program used a block the scan missed (R2)",
+    );
+}
+
+#[test]
+fn a_block_unmapped_at_the_exit_of_a_munmap_is_not_freed() {
+    changed_at_exit_is_not_freed(
+        libc::SYS_munmap,
+        Box::new(unmap_block),
+        "a held block at 0x8000 could not be read: unmapped 0x8000",
+    );
+}
+
+#[test]
+fn a_block_moved_away_at_the_exit_of_an_mremap_is_not_freed() {
+    changed_at_exit_is_not_freed(
+        libc::SYS_mremap,
+        Box::new(unmap_block),
+        "a held block at 0x8000 could not be read: unmapped 0x8000",
     );
 }
 
