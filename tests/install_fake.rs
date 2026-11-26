@@ -598,10 +598,10 @@ fn a_call_in_the_patch_is_refused() {
 }
 
 #[test]
-fn an_undecodable_instruction_elsewhere_in_text_refuses_every_entry() {
+fn an_undecodable_instruction_elsewhere_in_text_refuses_no_entry() {
     let image = static_image();
     let (text, size) = text_section(image);
-    let mut fake = Fake::new(image, vec![]);
+    let mut fake = Fake::new(image, vec![trap(), seccomp(), trap()]);
     let at = text_instructions(&fake)
         .iter()
         .map(Instruction::ip)
@@ -609,18 +609,14 @@ fn an_undecodable_instruction_elsewhere_in_text_refuses_every_entry() {
         .expect("an instruction in the second half of .text");
     fake.poke(at, &[0x06]);
 
-    let skipped = no_entries(install_hooks(&mut fake, pid()));
+    let installed = install_hooks(&mut fake, pid()).expect("installs");
 
-    assert!(!skipped.is_empty());
-    let refused = refusals(&skipped);
-    assert!(!refused.is_empty(), "got {skipped:?}");
     assert!(
-        refused
-            .iter()
-            .all(|skip| *skip == Skip::Refused(Refusal::Undecodable { at })),
-        "got {skipped:?}"
+        refusals(&installed.skipped).is_empty(),
+        "got {:?}",
+        installed.skipped
     );
-    assert!(fake.writes.is_empty());
+    assert!(installed.hooked.contains(&"malloc"));
 }
 
 #[test]

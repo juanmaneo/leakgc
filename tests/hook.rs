@@ -59,11 +59,37 @@ fn undecodable_bytes_are_refused() {
 }
 
 #[test]
-fn undecodable_bytes_elsewhere_in_text_are_refused() {
+fn undecodable_bytes_elsewhere_in_text_do_not_refuse_the_function() {
+    // 0x06 is invalid, so the sweep of this section fails. Nothing branches into the patch.
+    let function = [0x48, 0x85, 0xff, 0x74, 0x00, 0xc3];
+    assert!(
+        plan(
+            ADDR,
+            &function,
+            &[(0x5000, &[0x06, 0xc3])],
+            ENTRY,
+            DISPLACED
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn branch_hidden_behind_undecodable_bytes_into_the_patch_is_refused() {
+    // 0x06 at 0x1020 stops the sweep. The jmp rel8 at 0x1021 lands on 0x1002, inside the patch.
     let function = [0x48, 0x85, 0xff, 0x74, 0x00, 0xc3];
     assert_eq!(
-        plan(ADDR, &function, &[(0x5000, &[0x06])], ENTRY, DISPLACED),
-        Err(Refusal::Undecodable { at: 0x5000 })
+        plan(
+            ADDR,
+            &function,
+            &[(0x1020, &[0x06, 0xeb, 0xdf])],
+            ENTRY,
+            DISPLACED
+        ),
+        Err(Refusal::BranchIntoPatch {
+            at: 0x1021,
+            target: ADDR + 2,
+        })
     );
 }
 

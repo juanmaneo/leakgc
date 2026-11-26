@@ -19,7 +19,7 @@ const ENDBR64: [u8; 4] = [0xf3, 0x0f, 0x1e, 0xfa];
 /// Why an entry point is not hooked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// An instruction in the function or its executable sections does not decode.
+    /// An instruction in the function does not decode.
     Undecodable { at: u64 },
     /// The function ends before the displaced instructions cover `JMP_LEN` bytes.
     ShortPatch,
@@ -51,10 +51,12 @@ pub struct Plan {
 /// Checks the function at `addr` and returns the patch plan or the reason to
 /// refuse.
 ///
-/// `function` holds the bytes of the whole symbol. `text` holds the image's
-/// executable sections as `(address, bytes)`. Every byte in them must decode, and
-/// no near branch in them may land inside the patched bytes, so the scan covers
-/// all of `.text` and not only the function (D29). `entry` is where the jump
+/// `function` holds the bytes of the whole symbol. Every byte of the function
+/// must decode. `text` holds the image's executable sections as `(address,
+/// bytes)`. No near branch in them may land inside the patched bytes, so the scan
+/// covers all of `.text` and not only the function (D29). A section that does
+/// not decode is scanned at every byte offset, and its undecodable bytes do not
+/// refuse the function (D84). `entry` is where the jump
 /// lands. `displaced_at` is where the displaced instructions will run.
 pub fn plan(
     addr: u64,
@@ -81,14 +83,7 @@ pub fn plan(
     }
 
     for &(start, code) in text {
-        let mut decoder = Decoder::with_ip(64, code, start, DecoderOptions::NONE);
-        while decoder.can_decode() {
-            let ins = decoder.decode();
-            if ins.is_invalid() {
-                return Err(Refusal::Undecodable { at: ins.ip() });
-            }
-            branch_into_patch(&ins, patch_at, patch_end)?;
-        }
+        check_section(start, code, patch_at, patch_end)?;
     }
     for ins in &insns {
         branch_into_patch(ins, patch_at, patch_end)?;
@@ -129,6 +124,42 @@ pub fn plan(
         jump,
         displaced_code,
     })
+}
+
+/// Checks one executable section for near branches into the patch. A section
+/// that decodes from its first byte to its last is swept once. A section with an
+/// undecodable byte, such as the APE shell header that Cosmopolitan puts in
+/// `.head`, loses the sweep's place, so every byte offset is checked instead
+/// (D84).
+fn check_section(start: u64, code: &[u8], patch_at: u64, patch_end: u64) -> Result<(), Refusal> {
+    let mut decoder = Decoder::with_ip(64, code, start, DecoderOptions::NONE);
+    while decoder.can_decode() {
+        let ins = decoder.decode();
+        if ins.is_invalid() {
+            return check_every_offset(start, code, patch_at, patch_end);
+        }
+        branch_into_patch(&ins, patch_at, patch_end)?;
+    }
+    Ok(())
+}
+
+/// Decodes one instruction at every byte offset of `code`. An offset that does
+/// not decode is skipped. A branch that starts at an offset the sweep skipped is
+/// still checked.
+fn check_every_offset(
+    start: u64,
+    code: &[u8],
+    patch_at: u64,
+    patch_end: u64,
+) -> Result<(), Refusal> {
+    for offset in 0..code.len() {
+        let ip = start + offset as u64;
+        let ins = Decoder::with_ip(64, &code[offset..], ip, DecoderOptions::NONE).decode();
+        if !ins.is_invalid() {
+            branch_into_patch(&ins, patch_at, patch_end)?;
+        }
+    }
+    Ok(())
 }
 
 fn branch_into_patch(ins: &Instruction, patch_at: u64, patch_end: u64) -> Result<(), Refusal> {
