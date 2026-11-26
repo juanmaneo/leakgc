@@ -7,14 +7,14 @@ mod common;
 use std::collections::BTreeMap;
 
 use common::*;
-use leakgc::install::{DEFAULT_HINT, HEAD_OFFSET, RECORDS_OFFSET, REGION_LEN};
+use leakgc::install::{DEFAULT_HINT, RECORDS_OFFSET, REGION_LEN};
 use leakgc::ledger::{ImageReport, Reachability, Site};
 use leakgc::monitor::Monitor;
 use leakgc::quarantine::POISON;
 use leakgc::ring::{CAPACITY, Kind, RECORD_LEN, Record};
+use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 
-const CALLER: u64 = 0x40_1000;
 const CLONE_VM: u64 = 0x100;
 const SHARED_BLOCK: u64 = 0x6000_0000;
 /// The stack mapping. `initial_regs` puts `rsp` at 0x7fff_f000, inside it.
@@ -70,38 +70,6 @@ fn hooked_every(collect_every: u64) -> Hooked {
         fake,
         jumps,
         pristine,
-    }
-}
-
-fn set_head(fake: &mut Fake, head: u64) {
-    fake.poke(DEFAULT_HINT + HEAD_OFFSET, &head.to_le_bytes());
-}
-
-/// Writes ring slot `index` as the entry and exit code would. An open slot
-/// has no result yet.
-fn write_slot(fake: &mut Fake, index: u64, record: Record, done: bool) {
-    let mut bytes = [0u8; RECORD_LEN];
-    for (at, word) in [
-        (0, record.size),
-        (8, record.caller),
-        (16, record.arg),
-        (24, record.result),
-        (32, record.kind as u64),
-        (40, u64::from(done)),
-    ] {
-        bytes[at..at + 8].copy_from_slice(&word.to_le_bytes());
-    }
-    let at = DEFAULT_HINT + RECORDS_OFFSET + (index % CAPACITY) * RECORD_LEN as u64;
-    fake.poke(at, &bytes);
-}
-
-fn malloc_record(size: u64, result: u64) -> Record {
-    Record {
-        kind: Kind::Malloc,
-        size,
-        caller: CALLER,
-        arg: 0,
-        result,
     }
 }
 
@@ -848,16 +816,6 @@ fn a_shared_clone_in_an_image_that_is_not_hooked_changes_nothing() {
     assert_eq!(report.notes.len(), 2, "{:?}", report.notes);
 }
 
-fn free_record(ptr: u64) -> Record {
-    Record {
-        kind: Kind::Free,
-        size: 0,
-        caller: CALLER,
-        arg: ptr,
-        result: 0,
-    }
-}
-
 /// A process with a live block at 0x7000 and an unreached block at 0x8000,
 /// which the first check holds in quarantine.
 fn with_a_held_block() -> Hooked {
@@ -925,4 +883,434 @@ fn a_block_that_cannot_be_poisoned_makes_the_process_untrusted() {
             "a block at 0x8000 could not be poisoned: injected write failure".to_string()
         )
     );
+}
+
+/// The address and size of the first function in the static fixture with this
+/// name and a body. Some names appear twice in the fixture.
+fn symbol(name: &str) -> (u64, u64) {
+    let elf = goblin::elf::Elf::parse(static_image()).expect("the fixture parses");
+    elf.syms
+        .iter()
+        .find(|sym| {
+            sym.is_function() && sym.st_size > 0 && elf.strtab.get_at(sym.st_name) == Some(name)
+        })
+        .map(|sym| (sym.st_value, sym.st_size))
+        .expect("the fixture has the function")
+}
+
+/// A process whose first check has held the unreached block at 0x8000, and
+/// whose second check, at a memory call, has confirmed it for injection.
+fn confirmed_held() -> Hooked {
+    let mut h = with_a_held_block();
+    h.monitor.trapped(&mut h.fake, pid(), None);
+    assert!(
+        h.monitor.trapped(&mut h.fake, pid(), Some(libc::SYS_mmap)),
+        "the confirmed block waits for the exit of this call"
+    );
+    h
+}
+
+/// Two unreached blocks, at 0x8000 and 0xa000, both confirmed for injection.
+fn with_two_confirmed_blocks() -> Hooked {
+    let mut h = hooked();
+    map_writable(&mut h.fake, 0x7000, 0xb000);
+    set_head(&mut h.fake, 3);
+    write_slot(&mut h.fake, 0, malloc_record(16, 0x7000), true);
+    write_slot(&mut h.fake, 1, malloc_record(32, 0x8000), true);
+    write_slot(&mut h.fake, 2, malloc_record(16, 0xa000), true);
+    put_word(&mut h.fake, RSP + 0x100, 0x7000);
+    h.monitor.trapped(&mut h.fake, pid(), None);
+    assert!(h.monitor.trapped(&mut h.fake, pid(), Some(libc::SYS_mmap)));
+    h
+}
+
+fn signal_stop(h: &mut Hooked, signal: Signal) -> Option<Vec<Signal>> {
+    h.monitor.injected_stop(&mut h.fake, pid(), signal)
+}
+
+/// The program frees the held block at 0x8000 itself. A block that is still
+/// held makes the process untrusted, and the next trapped call reports it.
+fn program_frees_held_block(h: &mut Hooked) {
+    write_slot(&mut h.fake, 2, free_record(0x8000), true);
+    set_head(&mut h.fake, 3);
+    h.monitor.trapped(&mut h.fake, pid(), None);
+}
+
+#[test]
+fn a_confirmed_block_is_freed_by_an_injected_call_at_the_exit_of_a_memory_call() {
+    let mut h = confirmed_held();
+    let (start, stop) = trampoline(&h.fake);
+    let saved = h.fake.regs;
+
+    h.monitor.syscall_exited(&mut h.fake, pid());
+
+    assert_eq!(h.fake.regs.rip, start);
+    assert_eq!(h.fake.regs.rdi, 0x8000);
+    assert_eq!(
+        h.fake.regs.rsp, 0x7fff_ef00,
+        "the call runs below the stack pointer, clear of the red zone"
+    );
+    // The injected free records itself in the ring, then the trampoline reaches its int3.
+    write_slot(&mut h.fake, 2, free_record(0x8000), true);
+    set_head(&mut h.fake, 3);
+    h.fake.regs.rip = stop + 1;
+
+    assert_eq!(signal_stop(&mut h, Signal::SIGTRAP), Some(vec![]));
+    assert_eq!(
+        h.fake.regs,
+        libc::user_regs_struct {
+            orig_rax: u64::MAX,
+            ..saved
+        }
+    );
+    assert!(!h.monitor.trapped(&mut h.fake, pid(), None));
+    assert!(h.fake.signals.is_empty());
+    let report = only(h.monitor.finish());
+    assert!(has_note(
+        &report,
+        "freed 1 unreached blocks by injected free calls"
+    ));
+    assert_eq!(report.reachability, Reachability::Checked { lost: vec![] });
+}
+
+#[test]
+fn an_injected_free_leaves_the_ledger_when_the_injection_ends() {
+    let mut h = confirmed_held();
+    let (_, stop) = trampoline(&h.fake);
+    h.monitor.syscall_exited(&mut h.fake, pid());
+    write_slot(&mut h.fake, 2, free_record(0x8000), true);
+    set_head(&mut h.fake, 3);
+    h.fake.regs.rip = stop + 1;
+
+    assert_eq!(signal_stop(&mut h, Signal::SIGTRAP), Some(vec![]));
+
+    let report = only(h.monitor.finish());
+    assert_eq!(
+        report.sites,
+        vec![Site {
+            caller: CALLER,
+            blocks: 1,
+            bytes: 16
+        }],
+        "the freed block is gone without waiting for a trapped call"
+    );
+}
+
+#[test]
+fn two_confirmed_blocks_are_freed_one_after_the_other() {
+    let mut h = with_two_confirmed_blocks();
+    let (start, stop) = trampoline(&h.fake);
+    let saved = h.fake.regs;
+    h.monitor.syscall_exited(&mut h.fake, pid());
+    assert_eq!(h.fake.regs.rdi, 0x8000);
+
+    h.fake.regs.rip = stop + 1;
+    assert_eq!(signal_stop(&mut h, Signal::SIGTRAP), Some(vec![]));
+    assert_eq!(h.fake.regs.rdi, 0xa000);
+    assert_eq!(h.fake.regs.rip, start);
+
+    h.fake.regs.rip = stop + 1;
+    assert_eq!(signal_stop(&mut h, Signal::SIGTRAP), Some(vec![]));
+    assert_eq!(
+        h.fake.regs,
+        libc::user_regs_struct {
+            orig_rax: u64::MAX,
+            ..saved
+        }
+    );
+    let report = only(h.monitor.finish());
+    assert!(has_note(
+        &report,
+        "freed 2 unreached blocks by injected free calls"
+    ));
+}
+
+#[test]
+fn a_block_that_is_only_held_is_not_injected_at_the_first_memory_call() {
+    let mut h = with_a_held_block();
+    assert!(!h.monitor.trapped(&mut h.fake, pid(), Some(libc::SYS_mmap)));
+    let before = h.fake.regs;
+
+    h.monitor.syscall_exited(&mut h.fake, pid());
+
+    assert_eq!(h.fake.regs, before);
+    assert!(h.fake.signals.is_empty());
+}
+
+#[test]
+fn a_confirmed_block_waits_for_a_memory_call_and_is_not_injected_at_another_call() {
+    let mut h = confirmed_held();
+    assert!(
+        !h.monitor
+            .trapped(&mut h.fake, pid(), Some(libc::SYS_getpid))
+    );
+    let before = h.fake.regs;
+
+    h.monitor.syscall_exited(&mut h.fake, pid());
+
+    assert_eq!(h.fake.regs, before);
+}
+
+#[test]
+fn an_exit_that_no_check_asked_for_changes_nothing() {
+    let mut h = hooked();
+    let before = h.fake.regs;
+
+    h.monitor.syscall_exited(&mut h.fake, pid());
+
+    assert_eq!(h.fake.regs, before);
+    assert!(h.fake.signals.is_empty());
+}
+
+#[test]
+fn an_unknown_process_is_ignored_by_the_injection_calls() {
+    let mut h = hooked();
+    let other = Pid::from_raw(TRACEE + 1);
+
+    assert!(!h.monitor.trapped(&mut h.fake, other, Some(libc::SYS_mmap)));
+    h.monitor.syscall_exited(&mut h.fake, other);
+    assert_eq!(
+        h.monitor.injected_stop(&mut h.fake, other, Signal::SIGTRAP),
+        None
+    );
+    assert!(h.fake.signals.is_empty());
+}
+
+#[test]
+fn an_injection_is_not_started_when_the_registers_cannot_be_read() {
+    let mut h = confirmed_held();
+    let before = h.fake.regs;
+    h.fake.fail_regs = true;
+
+    h.monitor.syscall_exited(&mut h.fake, pid());
+
+    h.fake.fail_regs = false;
+    assert_eq!(h.fake.regs, before);
+    assert!(h.fake.signals.is_empty());
+    program_frees_held_block(&mut h);
+    let report = only(h.monitor.finish());
+    assert!(has_note(&report, "a held block at 0x8000 was freed"));
+}
+
+#[test]
+fn an_injection_is_not_started_when_the_stack_cannot_be_read() {
+    let mut h = confirmed_held();
+    let before = h.fake.regs;
+    h.fake.fail_reads = true;
+
+    h.monitor.syscall_exited(&mut h.fake, pid());
+
+    h.fake.fail_reads = false;
+    assert_eq!(h.fake.regs, before);
+    assert!(h.fake.signals.is_empty());
+    program_frees_held_block(&mut h);
+    let report = only(h.monitor.finish());
+    assert!(has_note(&report, "a held block at 0x8000 was freed"));
+}
+
+#[test]
+fn an_injection_is_refused_inside_the_allocator() {
+    let mut h = confirmed_held();
+    let (start, _) = symbol("_int_malloc");
+    h.fake.regs.rip = start;
+    let before = h.fake.regs;
+
+    h.monitor.syscall_exited(&mut h.fake, pid());
+
+    assert_eq!(h.fake.regs, before);
+    assert!(h.fake.signals.is_empty());
+}
+
+#[test]
+fn an_injection_is_refused_when_the_stack_points_into_the_allocator() {
+    let mut h = confirmed_held();
+    put_word(&mut h.fake, RSP + 0x200, symbol("_int_malloc").0);
+    let before = h.fake.regs;
+
+    h.monitor.syscall_exited(&mut h.fake, pid());
+
+    assert_eq!(h.fake.regs, before);
+    assert!(h.fake.signals.is_empty());
+}
+
+#[test]
+fn an_injection_is_refused_without_room_below_the_stack_pointer() {
+    let mut h = confirmed_held();
+    map_writable(&mut h.fake, 0, 0x1000);
+    h.fake.regs.rsp = 0x80;
+    let before = h.fake.regs;
+
+    h.monitor.syscall_exited(&mut h.fake, pid());
+
+    assert_eq!(h.fake.regs, before);
+    assert!(h.fake.signals.is_empty());
+}
+
+#[test]
+fn an_injection_that_cannot_start_leaves_its_block_held() {
+    let mut h = confirmed_held();
+    h.fake.fail_set_regs = true;
+
+    h.monitor.syscall_exited(&mut h.fake, pid());
+
+    h.fake.fail_set_regs = false;
+    assert!(h.fake.signals.is_empty());
+    program_frees_held_block(&mut h);
+    let report = only(h.monitor.finish());
+    assert!(has_note(
+        &report,
+        "the injected free of 0x8000 could not start ("
+    ));
+    assert!(has_note(&report, "a held block at 0x8000 was freed"));
+}
+
+#[test]
+fn a_second_free_that_cannot_start_kills_the_process() {
+    let mut h = with_two_confirmed_blocks();
+    let (_, stop) = trampoline(&h.fake);
+    h.monitor.syscall_exited(&mut h.fake, pid());
+    h.fake.regs.rip = stop + 1;
+    h.fake.fail_set_regs = true;
+
+    assert_eq!(signal_stop(&mut h, Signal::SIGTRAP), Some(vec![]));
+
+    h.fake.fail_set_regs = false;
+    assert_eq!(h.fake.signals, vec![Signal::SIGKILL]);
+    let report = only(h.monitor.finish());
+    assert!(report.notes.iter().any(|note| {
+        note.starts_with("the injected free of 0xa000 could not start (")
+            && note.ends_with("): the process was killed")
+    }));
+}
+
+#[test]
+fn a_process_whose_registers_cannot_be_restored_is_killed() {
+    let mut h = confirmed_held();
+    let (_, stop) = trampoline(&h.fake);
+    h.monitor.syscall_exited(&mut h.fake, pid());
+    h.fake.regs.rip = stop + 1;
+    h.fake.fail_set_regs = true;
+
+    assert_eq!(signal_stop(&mut h, Signal::SIGTRAP), Some(vec![]));
+
+    h.fake.fail_set_regs = false;
+    assert_eq!(h.fake.signals, vec![Signal::SIGKILL]);
+    let report = only(h.monitor.finish());
+    assert!(has_note(
+        &report,
+        "registers could not be restored after injected code"
+    ));
+}
+
+#[test]
+fn a_kill_makes_the_report_incomplete_without_a_later_check() {
+    let mut h = confirmed_held();
+    h.monitor.syscall_exited(&mut h.fake, pid());
+
+    assert_eq!(signal_stop(&mut h, Signal::SIGSEGV), Some(vec![]));
+
+    let report = only(h.monitor.finish());
+    assert_eq!(
+        report.reachability,
+        Reachability::Incomplete("signal SIGSEGV in injected code".to_string())
+    );
+}
+
+#[test]
+fn a_trap_away_from_the_injected_stop_kills_the_process() {
+    let mut h = confirmed_held();
+    h.monitor.syscall_exited(&mut h.fake, pid());
+
+    assert_eq!(signal_stop(&mut h, Signal::SIGTRAP), Some(vec![]));
+
+    assert_eq!(h.fake.signals, vec![Signal::SIGKILL]);
+    let report = only(h.monitor.finish());
+    assert!(has_note(&report, "unexpected SIGTRAP at 0x"));
+}
+
+#[test]
+fn a_fault_in_injected_code_kills_the_process() {
+    let mut h = confirmed_held();
+    h.monitor.syscall_exited(&mut h.fake, pid());
+
+    assert_eq!(signal_stop(&mut h, Signal::SIGSEGV), Some(vec![]));
+
+    assert_eq!(h.fake.signals, vec![Signal::SIGKILL]);
+    assert!(!h.monitor.trapped(&mut h.fake, pid(), None));
+    let report = only(h.monitor.finish());
+    assert_eq!(
+        report.reachability,
+        Reachability::Incomplete("signal SIGSEGV in injected code".to_string())
+    );
+}
+
+#[test]
+fn a_failed_kill_is_reported_and_the_process_is_untrusted() {
+    let mut h = confirmed_held();
+    h.monitor.syscall_exited(&mut h.fake, pid());
+    h.fake.fail_kill = true;
+
+    assert_eq!(signal_stop(&mut h, Signal::SIGSEGV), Some(vec![]));
+
+    let report = only(h.monitor.finish());
+    assert!(has_note(
+        &report,
+        "signal SIGSEGV in injected code: the process could not be killed"
+    ));
+}
+
+#[test]
+fn a_signal_during_injected_code_is_held_until_the_process_is_restored() {
+    let mut h = confirmed_held();
+    let (_, stop) = trampoline(&h.fake);
+    h.monitor.syscall_exited(&mut h.fake, pid());
+    let armed = h.fake.regs;
+
+    assert_eq!(signal_stop(&mut h, Signal::SIGCHLD), Some(vec![]));
+
+    assert_eq!(h.fake.regs, armed, "the process is not moved by the signal");
+    h.fake.regs.rip = stop + 1;
+    assert_eq!(
+        signal_stop(&mut h, Signal::SIGTRAP),
+        Some(vec![Signal::SIGCHLD])
+    );
+    assert!(h.fake.signals.is_empty());
+}
+
+#[test]
+fn an_unreadable_stop_inside_injected_code_kills_the_process() {
+    let mut h = confirmed_held();
+    h.monitor.syscall_exited(&mut h.fake, pid());
+    h.fake.fail_regs = true;
+
+    assert_eq!(signal_stop(&mut h, Signal::SIGTRAP), Some(vec![]));
+
+    h.fake.fail_regs = false;
+    assert_eq!(h.fake.signals, vec![Signal::SIGKILL]);
+    let report = only(h.monitor.finish());
+    assert!(has_note(
+        &report,
+        "registers unreadable at the end of injected code"
+    ));
+}
+
+#[test]
+fn a_memory_call_during_injected_code_is_not_checked() {
+    let mut h = confirmed_held();
+    h.monitor.syscall_exited(&mut h.fake, pid());
+    write_slot(&mut h.fake, 2, malloc_record(16, 0xa000), true);
+    set_head(&mut h.fake, 3);
+    let writes = h.fake.writes.len();
+
+    assert!(!h.monitor.trapped(&mut h.fake, pid(), Some(libc::SYS_mmap)));
+
+    assert_eq!(h.fake.writes.len(), writes, "no check runs while injected");
+}
+
+#[test]
+fn a_stop_that_is_not_an_injection_is_left_to_the_supervisor() {
+    let mut h = hooked();
+
+    assert_eq!(signal_stop(&mut h, Signal::SIGTRAP), None);
+    assert_eq!(signal_stop(&mut h, Signal::SIGCHLD), None);
 }

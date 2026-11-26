@@ -327,29 +327,20 @@ impl<T: Tracer> Session<'_, '_, T> {
                         pid.as_raw()
                     );
                 }
-                self.monitor.trapped(&mut *self.tracer, pid, nr.ok());
-                let _ = self.tracer.syscall(pid);
+                if self.monitor.trapped(&mut *self.tracer, pid, nr.ok()) {
+                    let _ = self.tracer.syscall(pid);
+                } else {
+                    let _ = self.tracer.cont(pid, None);
+                }
             }
             Event::SyscallExit(pid) => {
+                self.monitor.syscall_exited(&mut *self.tracer, pid);
                 let _ = self.tracer.cont(pid, None);
             }
             Event::Exec(pid) => {
                 self.tracees.insert(pid);
                 let pending_signals = self.monitor.exec(&mut *self.tracer, pid);
-                for signal in pending_signals {
-                    if let Err(error) = self.tracer.send_signal(pid, signal) {
-                        // ESRCH means the tracee is already gone, so there is nothing to deliver to.
-                        if error != Errno::ESRCH {
-                            self.failed = true;
-                            eprintln!(
-                                "leakgc: cannot re-queue {signal} for pid {}: {error}",
-                                pid.as_raw()
-                            );
-                        }
-                    } else {
-                        self.redelivered.entry(pid).or_default().push_back(signal);
-                    }
-                }
+                self.requeue(pid, pending_signals);
                 let _ = self.tracer.cont(pid, None);
             }
             Event::Fork(parent) => {
@@ -382,6 +373,11 @@ impl<T: Tracer> Session<'_, '_, T> {
                     }
                     return;
                 }
+                if let Some(held) = self.monitor.injected_stop(&mut *self.tracer, pid, signal) {
+                    self.requeue(pid, held);
+                    let _ = self.tracer.cont(pid, None);
+                    return;
+                }
                 // Ptrace-owned SIGSTOP and SIGTRAP stops are suppressed unless
                 // this supervisor explicitly re-queued the target signal.
                 let deferred = self.redelivered.get_mut(&pid).and_then(|signals| {
@@ -402,6 +398,25 @@ impl<T: Tracer> Session<'_, '_, T> {
                 let _ = self.tracer.cont(pid, pass);
             }
             Event::Ignored => {}
+        }
+    }
+
+    /// Sends the signals that were held back, so the tracee receives them when
+    /// it resumes. Each one that is sent is expected back as a redelivery.
+    fn requeue(&mut self, pid: Pid, signals: Vec<Signal>) {
+        for signal in signals {
+            if let Err(error) = self.tracer.send_signal(pid, signal) {
+                // ESRCH means the tracee is already gone, so there is nothing to deliver to.
+                if error != Errno::ESRCH {
+                    self.failed = true;
+                    eprintln!(
+                        "leakgc: cannot re-queue {signal} for pid {}: {error}",
+                        pid.as_raw()
+                    );
+                }
+            } else {
+                self.redelivered.entry(pid).or_default().push_back(signal);
+            }
         }
     }
 

@@ -1,9 +1,11 @@
 //! Supervisor control flow with every operating-system result scripted. The
 //! real-process behaviour is covered in `supervisor_real.rs`.
 
-use std::collections::VecDeque;
+use std::cell::Cell;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::io::{self, Write};
+use std::rc::Rc;
 
 use nix::errno::Errno;
 use nix::sys::signal::Signal;
@@ -11,12 +13,16 @@ use nix::sys::wait::WaitStatus;
 use nix::unistd::Pid;
 mod common;
 
+use leakgc::install::{DEFAULT_HINT, REGION_LEN};
 use leakgc::supervisor::{Event, Tracer, classify, supervise_with};
 
 const STUB: i32 = 100;
 const CHILD: i32 = 101;
 const PTRACE_EVENT_EXEC: i32 = 4;
 const PTRACE_EVENT_SECCOMP: i32 = 7;
+/// The stack mapping of the install tracee, and the stack pointer it starts with.
+const STACK: (u64, u64) = (0x7fff_e000, 0x7fff_f800);
+const RSP: u64 = 0x7fff_f000;
 const MAPS: &str = "\
 00400000-00401000 r-xp 00000000 08:01 1 /bin/game
 00601000-00602000 rw-p 00001000 08:01 1 /bin/game
@@ -39,6 +45,7 @@ enum Call {
 }
 
 type Scripted = nix::Result<WaitStatus>;
+type Update = Box<dyn FnMut(&mut common::Fake)>;
 
 struct Fake {
     stopped: VecDeque<Scripted>,
@@ -51,9 +58,13 @@ struct Fake {
     install: Option<common::Fake>,
     started: bool,
     syscall_result: nix::Result<i64>,
-    maps: Option<&'static str>,
+    maps: Option<String>,
     events: VecDeque<nix::Result<i64>>,
     calls: Vec<Call>,
+    any_waits: usize,
+    /// Runs against the install tracee before the `wait_any` call with this
+    /// index, so a test can change memory or registers between two stops.
+    updates: BTreeMap<usize, Update>,
 }
 
 impl Fake {
@@ -69,9 +80,11 @@ impl Fake {
             install: None,
             started: false,
             syscall_result: Ok(libc::SYS_execve),
-            maps: Some(MAPS),
+            maps: Some(MAPS.to_owned()),
             events: VecDeque::new(),
             calls: Vec::new(),
+            any_waits: 0,
+            updates: BTreeMap::new(),
         }
     }
 }
@@ -103,6 +116,11 @@ impl Tracer for Fake {
 
     fn wait_any(&mut self) -> nix::Result<WaitStatus> {
         self.calls.push(Call::WaitAny);
+        let index = self.any_waits;
+        self.any_waits += 1;
+        if let Some(update) = self.updates.get_mut(&index) {
+            update(self.install.as_mut().expect("install tracer configured"));
+        }
         self.any.pop_front().unwrap_or(Err(Errno::ECHILD))
     }
 
@@ -138,7 +156,7 @@ impl Tracer for Fake {
     fn read_maps(&mut self, pid: Pid) -> io::Result<String> {
         self.calls.push(Call::ReadMaps(pid.as_raw()));
         self.maps
-            .map(str::to_owned)
+            .clone()
             .ok_or_else(|| io::Error::other("no /proc"))
     }
 
@@ -266,7 +284,7 @@ fn happy_path_resumes_every_stop_and_returns_the_root_exit_code() {
             Call::Kill(STUB, Signal::SIGCONT),
             Call::WaitAny,
             Call::SyscallNr(STUB),
-            Call::Syscall(STUB),
+            Call::Cont(STUB, None),
             Call::WaitAny,
             Call::Cont(STUB, None),
             Call::WaitAny,
@@ -340,7 +358,7 @@ fn a_signal_seen_during_install_is_requeued_before_the_exec_resumes() {
 }
 
 #[test]
-fn a_trapped_call_is_resumed_to_its_exit_and_then_continued() {
+fn a_trapped_call_with_no_injection_waiting_is_continued_and_its_exit_is_continued() {
     let mut tracer = Fake::new(
         vec![stopped(STUB, Signal::SIGSTOP)],
         vec![
@@ -355,13 +373,19 @@ fn a_trapped_call_is_resumed_to_its_exit_and_then_continued() {
     let (code, _) = run(&mut tracer, false);
 
     assert_eq!(code, 0);
+    assert!(
+        !tracer.calls.contains(&Call::Syscall(STUB)),
+        "no exit is requested without an injection: {:?}",
+        tracer.calls
+    );
     let trapped = tracer
         .calls
         .iter()
-        .position(|call| *call == Call::Syscall(STUB))
-        .expect("the trapped call is resumed to its exit");
-    assert_eq!(tracer.calls[trapped + 1], Call::WaitAny);
-    assert_eq!(tracer.calls[trapped + 2], Call::Cont(STUB, None));
+        .position(|call| *call == Call::SyscallNr(STUB))
+        .expect("the trapped call is named");
+    assert_eq!(tracer.calls[trapped + 1], Call::Cont(STUB, None));
+    assert_eq!(tracer.calls[trapped + 2], Call::WaitAny);
+    assert_eq!(tracer.calls[trapped + 3], Call::Cont(STUB, None));
 }
 
 #[test]
@@ -395,6 +419,109 @@ fn a_target_sigtrap_is_not_suppressed_as_a_ptrace_step_trap() {
         tracer
             .calls
             .contains(&Call::Cont(STUB, Some(Signal::SIGTRAP)))
+    );
+}
+
+/// Fills the ring with `pairs` allocations from `first`, each freed at once,
+/// so they count toward a check without staying live.
+fn churn(fake: &mut common::Fake, first: u64, base: u64, pairs: u64) {
+    for i in 0..pairs {
+        let ptr = base + i * 0x20;
+        common::write_slot(fake, first + 2 * i, common::malloc_record(16, ptr), true);
+        common::write_slot(fake, first + 2 * i + 1, common::free_record(ptr), true);
+    }
+}
+
+/// The first check holds an unreached block. The second check, at a memory
+/// call, confirms it, and its injected free runs at the exit of that call. The
+/// stop at the end of the injected code restores the registers it saved.
+#[test]
+fn a_confirmed_block_is_freed_at_the_exit_of_a_memory_call_and_the_program_resumes() {
+    let mut install = common::Fake::new(
+        common::static_image(),
+        vec![common::trap(), common::seccomp(), common::trap()],
+    );
+    common::map_line(
+        &mut install,
+        DEFAULT_HINT,
+        DEFAULT_HINT + REGION_LEN,
+        "rwxp",
+    );
+    common::map_writable(&mut install, STACK.0, STACK.1);
+    common::map_writable(&mut install, 0x7000, 0x9000);
+    common::put_word(&mut install, RSP + 0x100, 0x7000);
+
+    let at_exit = Rc::new(Cell::new(None));
+    let recorder = Rc::clone(&at_exit);
+    let mut tracer = Fake::new(
+        vec![stopped(STUB, Signal::SIGSTOP)],
+        vec![
+            exec_event(STUB),
+            trap(STUB),
+            trap(STUB),
+            syscall_exit(STUB),
+            stopped(STUB, Signal::SIGTRAP),
+            exited(STUB, 0),
+        ],
+    );
+    tracer.syscall_result = Ok(libc::SYS_mmap);
+    tracer.maps = Some(install.maps.clone());
+    tracer.install = Some(install);
+    // 66 allocations before the first trapped call, so its check holds 0x8000.
+    tracer.updates.insert(
+        1,
+        Box::new(|fake: &mut common::Fake| {
+            common::set_head(fake, 130);
+            common::write_slot(fake, 0, common::malloc_record(16, 0x7000), true);
+            common::write_slot(fake, 1, common::malloc_record(32, 0x8000), true);
+            churn(fake, 2, 0x10000, 64);
+        }),
+    );
+    // 64 more allocations before the second, so its check confirms 0x8000.
+    tracer.updates.insert(
+        2,
+        Box::new(|fake: &mut common::Fake| {
+            churn(fake, 130, 0x20000, 64);
+            common::set_head(fake, 258);
+        }),
+    );
+    // The registers at the exit of the call, which the injected stop must restore.
+    tracer.updates.insert(
+        3,
+        Box::new(move |fake: &mut common::Fake| recorder.set(Some(fake.regs))),
+    );
+    // The injected free records itself, then its trampoline reaches the int3.
+    tracer.updates.insert(
+        4,
+        Box::new(|fake: &mut common::Fake| {
+            let (_, stop) = common::trampoline(fake);
+            common::write_slot(fake, 258, common::free_record(0x8000), true);
+            common::set_head(fake, 259);
+            fake.regs.rip = stop + 1;
+        }),
+    );
+
+    let (code, log) = run(&mut tracer, true);
+
+    assert_eq!(code, 0);
+    assert_eq!(
+        tracer
+            .calls
+            .iter()
+            .filter(|call| **call == Call::Syscall(STUB))
+            .count(),
+        1,
+        "only the second check asks for the exit of a call: {:?}",
+        tracer.calls
+    );
+    assert!(log.contains("freed 1 unreached blocks by injected free calls"));
+    let saved = at_exit.get().expect("the exit of the call was reached");
+    assert_eq!(
+        tracer.install.as_ref().expect("install configured").regs,
+        libc::user_regs_struct {
+            orig_rax: u64::MAX,
+            ..saved
+        }
     );
 }
 

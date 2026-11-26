@@ -46,6 +46,12 @@ impl Quarantine {
         })
     }
 
+    /// Stops holding `start`, because the program is freeing it on purpose (P5).
+    /// The injected free that does so must not be taken for a missed reference.
+    pub fn forget(&mut self, start: u64) {
+        self.held.remove(&start);
+    }
+
     /// The `(start, size)` of every block that has survived a full cycle, in address order.
     pub fn confirmed(&self) -> Vec<(u64, u64)> {
         self.held

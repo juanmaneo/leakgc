@@ -12,7 +12,8 @@ use std::sync::OnceLock;
 
 use goblin::elf::Elf;
 use goblin::elf::section_header::{SHF_ALLOC, SHT_PROGBITS};
-use leakgc::install::DEFAULT_HINT;
+use leakgc::install::{DEFAULT_HINT, HEAD_OFFSET, INJECT_LEN, INJECT_OFFSET, RECORDS_OFFSET};
+use leakgc::ring::{CAPACITY, Kind, RECORD_LEN, Record};
 use leakgc::supervisor::Tracer;
 use libc::user_regs_struct;
 use nix::errno::Errno;
@@ -93,8 +94,14 @@ pub struct Fake {
     pub fail_at: Option<usize>,
     /// Makes every `write_mem` fail, without counting toward `fail_at`.
     pub fail_writes: bool,
+    /// Each of these makes its call fail, without counting toward `fail_at`.
+    pub fail_regs: bool,
+    pub fail_set_regs: bool,
+    pub fail_reads: bool,
+    pub fail_kill: bool,
     pub calls: usize,
     pub writes: Vec<(u64, Vec<u8>)>,
+    pub signals: Vec<Signal>,
     pub maps: String,
 }
 
@@ -128,8 +135,13 @@ impl Fake {
             single_step_results: VecDeque::new(),
             fail_at: None,
             fail_writes: false,
+            fail_regs: false,
+            fail_set_regs: false,
+            fail_reads: false,
+            fail_kill: false,
             calls: 0,
             writes: Vec::new(),
+            signals: Vec::new(),
             maps: String::new(),
         }
     }
@@ -184,8 +196,12 @@ impl Tracer for Fake {
         unreachable!("install never resumes a trapped call")
     }
 
-    fn send_signal(&mut self, _pid: Pid, _sig: Signal) -> nix::Result<()> {
-        unreachable!("install never signals")
+    fn send_signal(&mut self, _pid: Pid, sig: Signal) -> nix::Result<()> {
+        self.signals.push(sig);
+        if self.fail_kill {
+            return Err(Errno::EPERM);
+        }
+        Ok(())
     }
 
     fn syscall_nr(&mut self, _pid: Pid) -> nix::Result<i64> {
@@ -207,14 +223,14 @@ impl Tracer for Fake {
     }
 
     fn regs(&mut self, _pid: Pid) -> nix::Result<user_regs_struct> {
-        if self.fails() {
+        if self.fail_regs || self.fails() {
             return Err(Errno::EIO);
         }
         Ok(self.regs)
     }
 
     fn set_regs(&mut self, _pid: Pid, regs: user_regs_struct) -> nix::Result<()> {
-        if self.fails() {
+        if self.fail_set_regs || self.fails() {
             return Err(Errno::EIO);
         }
         self.regs = regs;
@@ -249,7 +265,7 @@ impl Tracer for Fake {
     }
 
     fn read_mem(&mut self, _pid: Pid, addr: u64, len: usize) -> io::Result<Vec<u8>> {
-        if self.fails() {
+        if self.fail_reads || self.fails() {
             return Err(io::Error::other("injected read failure"));
         }
         (0..len as u64)
@@ -290,6 +306,64 @@ pub fn map_writable(fake: &mut Fake, start: u64, end: u64) {
 /// Writes one little-endian word at `addr`.
 pub fn put_word(fake: &mut Fake, addr: u64, value: u64) {
     fake.poke(addr, &value.to_le_bytes());
+}
+
+/// The caller address that every scripted record names.
+pub const CALLER: u64 = 0x40_1000;
+
+pub fn set_head(fake: &mut Fake, head: u64) {
+    fake.poke(DEFAULT_HINT + HEAD_OFFSET, &head.to_le_bytes());
+}
+
+/// Writes ring slot `index` as the entry and exit code would. An open slot
+/// has no result yet.
+pub fn write_slot(fake: &mut Fake, index: u64, record: Record, done: bool) {
+    let mut bytes = [0u8; RECORD_LEN];
+    for (at, word) in [
+        (0, record.size),
+        (8, record.caller),
+        (16, record.arg),
+        (24, record.result),
+        (32, record.kind as u64),
+        (40, u64::from(done)),
+    ] {
+        bytes[at..at + 8].copy_from_slice(&word.to_le_bytes());
+    }
+    let at = DEFAULT_HINT + RECORDS_OFFSET + (index % CAPACITY) * RECORD_LEN as u64;
+    fake.poke(at, &bytes);
+}
+
+pub fn malloc_record(size: u64, result: u64) -> Record {
+    Record {
+        kind: Kind::Malloc,
+        size,
+        caller: CALLER,
+        arg: 0,
+        result,
+    }
+}
+
+pub fn free_record(ptr: u64) -> Record {
+    Record {
+        kind: Kind::Free,
+        size: 0,
+        caller: CALLER,
+        arg: ptr,
+        result: 0,
+    }
+}
+
+/// The start of the injected-free trampoline written at install, and the
+/// address of the `int3` that ends it.
+pub fn trampoline(fake: &Fake) -> (u64, u64) {
+    let start = DEFAULT_HINT + INJECT_OFFSET;
+    let code = fake.bytes(start, INJECT_LEN as usize);
+    let last = code
+        .iter()
+        .rposition(|&byte| byte != 0)
+        .expect("the trampoline is written");
+    assert_eq!(code[last], 0xcc, "the trampoline ends at an int3");
+    (start, start + last as u64)
 }
 
 pub fn build_c(out_name: &str, flags: &[&str]) -> Vec<u8> {

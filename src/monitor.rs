@@ -5,17 +5,19 @@
 //! Once a process has made `COLLECT_EVERY` allocations since its last check,
 //! its next trapped call checks it for reachability. Each fork is checked
 //! whatever the count (D42, D47, D53). A check also holds the unreached blocks
-//! in quarantine, which poisons them (P5). Freeing is not built yet. Threads
-//! are not handled yet: the first clone that shares memory
-//! removes the hooks from that process, and its reachability checks end for
-//! good (P2b-3b).
+//! in quarantine, which poisons them (P5). Once a check has confirmed held
+//! blocks, the next memory call that returns frees them, one injected `free`
+//! at a time (P5). Threads are not handled yet: the first clone that shares
+//! memory removes the hooks from that process, and its reachability checks
+//! end for good (P2b-3b).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 
+use crate::inject::{may_inject, xsave_available};
 use crate::install::{
     HEAD_OFFSET, Installed, RECORDS_OFFSET, REGION_LEN, install_hooks, uninstall,
 };
@@ -30,6 +32,62 @@ const CLONE_VM: u64 = 0x0000_0100;
 
 /// Allocations between two reachability checks: the oracle's value (D42).
 pub const COLLECT_EVERY: u64 = 64;
+/// The trapped calls at whose exit an injected `free` may start (P5). These
+/// change the memory map. Clone and execve are left out: a clone can share
+/// memory with the injected call, and execve replaces the image.
+const EXIT_CALLS: [i64; 4] = [
+    libc::SYS_mmap,
+    libc::SYS_munmap,
+    libc::SYS_mremap,
+    libc::SYS_brk,
+];
+/// Bytes below the saved stack pointer that stay clear of injected code: the
+/// 128-byte red zone, and a margin.
+const CLEARANCE: u64 = 256;
+/// The words above the stack pointer that the R37 check reads.
+const STACK_WORDS: usize = 128;
+/// The direction flag, which the ABI requires to be clear on entry to a function.
+const DIRECTION_FLAG: u64 = 0x400;
+
+/// Where an injected `free` starts from. `saved` is the state the process
+/// stopped in, and the last injected call restores it. The calls run below
+/// `rsp`, which lies clear of the red zone of `saved`.
+#[derive(Debug, Clone, Copy)]
+struct Frame {
+    saved: libc::user_regs_struct,
+    rsp: u64,
+    trampoline: u64,
+    stop: u64,
+}
+
+impl Frame {
+    /// The registers that start an injected `free` of `block`. `orig_rax` is
+    /// -1, so no system call is restarted when the process resumes.
+    fn armed(&self, block: u64) -> libc::user_regs_struct {
+        libc::user_regs_struct {
+            rip: self.trampoline,
+            rsp: self.rsp,
+            rdi: block,
+            orig_rax: u64::MAX,
+            eflags: self.saved.eflags & !DIRECTION_FLAG,
+            ..self.saved
+        }
+    }
+}
+
+/// An injected `free` in progress, and the blocks still waiting for one.
+#[derive(Debug, Clone, Default)]
+struct Injection {
+    /// Set from the first free until the last one returns.
+    frame: Option<Frame>,
+    /// Blocks still to be freed, in the order they were confirmed.
+    queue: VecDeque<u64>,
+    /// Signals that stopped the process while injected code ran. They are
+    /// delivered once the process is restored.
+    deferred: Vec<Signal>,
+    /// Injected frees started so far.
+    freed: u64,
+}
 
 /// How far a drain got. Only `Settled` means the ledger matches the process now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +119,11 @@ struct Process {
     allocations_since_check: u64,
     /// Unreached blocks held and poisoned at a check (P5).
     quarantine: Quarantine,
+    /// The injected `free` in progress, if any (P5).
+    injection: Injection,
+    /// Blocks that the trapped call asked to free at its exit (P5). Empty
+    /// unless the call was trapped with confirmed blocks waiting.
+    inject_at_exit: Vec<u64>,
 }
 
 impl Process {
@@ -75,6 +138,8 @@ impl Process {
             reach: Reachability::Unchecked,
             allocations_since_check: 0,
             quarantine: Quarantine::default(),
+            injection: Injection::default(),
+            inject_at_exit: Vec::new(),
         }
     }
 
@@ -168,14 +233,15 @@ impl Process {
 
     /// Runs a reachability check over the ledger as it stands, unless the
     /// ledger does not match the process now. A result is a snapshot of the
-    /// outstanding blocks, so later records do not change it.
-    fn check<T: Tracer>(&mut self, tracer: &mut T, pid: Pid, drained: Drained) {
+    /// outstanding blocks, so later records do not change it. Returns whether
+    /// the check completed (P5).
+    fn check<T: Tracer>(&mut self, tracer: &mut T, pid: Pid, drained: Drained) -> bool {
         if let Some(reason) = &self.untrusted {
             self.reach = Reachability::Incomplete(reason.clone());
-            return;
+            return false;
         }
         let Some(hook) = self.hook.clone() else {
-            return;
+            return false;
         };
         match drained {
             Drained::Settled => {
@@ -183,23 +249,171 @@ impl Process {
                 self.allocations_since_check = 0;
                 let blocks: Vec<(u64, u64)> = self.ledger.live_blocks().collect();
                 let region = hook.base..hook.base + REGION_LEN;
-                self.reach = match reachable(tracer, pid, region, &blocks) {
+                let (reach, checked) = match reachable(tracer, pid, region, &blocks) {
                     Ok(scan) => match self.quarantine.update(tracer, pid, &blocks, &scan) {
-                        Ok(()) => Reachability::Checked {
-                            lost: self.ledger.unreached_sites(&scan.reached),
-                        },
+                        Ok(()) => (
+                            Reachability::Checked {
+                                lost: self.ledger.unreached_sites(&scan.reached),
+                            },
+                            true,
+                        ),
                         Err(reason) => {
                             self.untrusted.get_or_insert(reason.clone());
-                            Reachability::Incomplete(reason)
+                            (Reachability::Incomplete(reason), false)
                         }
                     },
-                    Err(reason) => Reachability::Incomplete(reason),
+                    Err(reason) => (Reachability::Incomplete(reason), false),
                 };
+                self.reach = reach;
+                checked
             }
             // The last complete result stays, and is still a snapshot of an earlier state.
-            Drained::InCall => {}
-            Drained::Behind(reason) => self.reach = Reachability::Incomplete(reason),
+            Drained::InCall => false,
+            Drained::Behind(reason) => {
+                self.reach = Reachability::Incomplete(reason);
+                false
+            }
         }
+    }
+
+    /// Starts an injected `free` of `blocks` at the exit of the trapped call,
+    /// which is a safe point only when the R37 check allows it. Otherwise the
+    /// blocks stay held.
+    fn start_injection<T: Tracer>(&mut self, tracer: &mut T, pid: Pid, blocks: Vec<u64>) {
+        let hook = self.hook.clone().expect("a checked process has hooks");
+        let Ok(saved) = tracer.regs(pid) else {
+            return;
+        };
+        let stack = read_stack(tracer, pid, saved.rsp).ok();
+        if !may_inject(
+            xsave_available(),
+            hook.internal.as_deref(),
+            saved.rip,
+            stack.as_deref(),
+        ) {
+            return;
+        }
+        let Some(rsp) = saved.rsp.checked_sub(CLEARANCE).map(|rsp| rsp & !63) else {
+            return;
+        };
+        let frame = Frame {
+            saved,
+            rsp,
+            trampoline: hook.trampoline,
+            stop: hook.stop,
+        };
+        let mut queue = VecDeque::from(blocks);
+        let first = queue.pop_front().expect("an injection has a block to free");
+        self.injection = Injection {
+            frame: Some(frame),
+            queue,
+            ..Injection::default()
+        };
+        if let Err(error) = self.arm(tracer, pid, frame, first) {
+            self.injection = Injection::default();
+            self.notes.push(format!(
+                "the injected free of 0x{first:x} could not start ({error}): the blocks stay held"
+            ));
+        }
+    }
+
+    /// Points the process at the injected `free` of `block`. The block stops
+    /// being held, because the program is freeing it on purpose.
+    fn arm<T: Tracer>(
+        &mut self,
+        tracer: &mut T,
+        pid: Pid,
+        frame: Frame,
+        block: u64,
+    ) -> nix::Result<()> {
+        tracer.set_regs(pid, frame.armed(block))?;
+        self.quarantine.forget(block);
+        self.injection.freed += 1;
+        Ok(())
+    }
+
+    /// A signal stopped the process while it may be running injected code.
+    /// Returns the signals to deliver once the process is restored, or `None`
+    /// when the stop is not part of an injection.
+    fn injected_stop<T: Tracer>(
+        &mut self,
+        tracer: &mut T,
+        pid: Pid,
+        signal: Signal,
+    ) -> Option<Vec<Signal>> {
+        let frame = self.injection.frame?;
+        if signal != Signal::SIGTRAP {
+            if is_fault(signal) {
+                return Some(self.abandon(
+                    tracer,
+                    pid,
+                    format!("signal {signal} in injected code"),
+                ));
+            }
+            self.injection.deferred.push(signal);
+            return Some(Vec::new());
+        }
+        let Ok(regs) = tracer.regs(pid) else {
+            return Some(self.abandon(
+                tracer,
+                pid,
+                "registers unreadable at the end of injected code".to_string(),
+            ));
+        };
+        if regs.rip != frame.stop + 1 {
+            return Some(self.abandon(
+                tracer,
+                pid,
+                format!("unexpected SIGTRAP at 0x{:x} in injected code", regs.rip),
+            ));
+        }
+        if let Some(next) = self.injection.queue.pop_front() {
+            return Some(match self.arm(tracer, pid, frame, next) {
+                Ok(()) => Vec::new(),
+                Err(error) => self.abandon(
+                    tracer,
+                    pid,
+                    format!("the injected free of 0x{next:x} could not start ({error})"),
+                ),
+            });
+        }
+        let restored = libc::user_regs_struct {
+            orig_rax: u64::MAX,
+            ..frame.saved
+        };
+        if let Err(error) = tracer.set_regs(pid, restored) {
+            return Some(self.abandon(
+                tracer,
+                pid,
+                format!("registers could not be restored after injected code ({error})"),
+            ));
+        }
+        // The injected frees wrote their own records, so the ledger catches up
+        // now rather than at the next trapped call.
+        self.drain(tracer, pid);
+        let injection = std::mem::take(&mut self.injection);
+        self.notes.push(format!(
+            "freed {} unreached blocks by injected free calls",
+            injection.freed
+        ));
+        Some(injection.deferred)
+    }
+
+    /// Ends an injection that cannot finish safely. The process is killed, and
+    /// the ledger is untrusted from here on. If the kill fails, the process
+    /// resumes where it stopped. No signals are returned for delivery.
+    fn abandon<T: Tracer>(&mut self, tracer: &mut T, pid: Pid, reason: String) -> Vec<Signal> {
+        self.injection = Injection::default();
+        let outcome = match tracer.send_signal(pid, Signal::SIGKILL) {
+            Ok(()) => "the process was killed".to_string(),
+            Err(error) => {
+                format!("the process could not be killed ({error}) and resumes where it stopped")
+            }
+        };
+        self.notes.push(format!("{reason}: {outcome}"));
+        let untrusted = self.untrusted.get_or_insert(reason).clone();
+        self.reach = Reachability::Incomplete(untrusted);
+        Vec::new()
     }
 
     /// Removes the hooks, after a clone that shares memory. The ledger is
@@ -274,10 +488,15 @@ impl Monitor {
     /// A process stopped at a trapped system call, which `syscall` names when
     /// it could be read. The ring is drained. A clone that shares memory removes
     /// the hooks. Then the process is checked for reachability, if enough
-    /// allocations have been counted since its last check.
-    pub fn trapped<T: Tracer>(&mut self, tracer: &mut T, pid: Pid, syscall: Option<i64>) {
+    /// allocations have been counted since its last check. Nothing is checked
+    /// while injected code runs.
+    ///
+    /// Returns whether the call must be resumed to its exit, because a check
+    /// has confirmed blocks for an injected free there (P5). The caller then
+    /// reports that exit with [`Monitor::syscall_exited`].
+    pub fn trapped<T: Tracer>(&mut self, tracer: &mut T, pid: Pid, syscall: Option<i64>) -> bool {
         let Some(process) = self.states.get_mut(&pid) else {
-            return;
+            return false;
         };
         let drained = process.drain(tracer, pid);
         if let Some(nr) = syscall
@@ -286,9 +505,46 @@ impl Monitor {
         {
             process.unhook(tracer, pid);
         }
-        if process.allocations_since_check >= self.collect_every {
-            process.check(tracer, pid, drained);
+        process.inject_at_exit.clear();
+        if process.injection.frame.is_some() {
+            return false;
         }
+        let checked = process.allocations_since_check >= self.collect_every
+            && process.check(tracer, pid, drained);
+        if checked && syscall.is_some_and(|nr| EXIT_CALLS.contains(&nr)) {
+            process.inject_at_exit = process
+                .quarantine
+                .confirmed()
+                .into_iter()
+                .map(|(start, _)| start)
+                .collect();
+        }
+        !process.inject_at_exit.is_empty()
+    }
+
+    /// A trapped call returned, at the exit that [`Monitor::trapped`] asked for.
+    /// If confirmed blocks are waiting, the first injected free starts here.
+    pub fn syscall_exited<T: Tracer>(&mut self, tracer: &mut T, pid: Pid) {
+        let Some(process) = self.states.get_mut(&pid) else {
+            return;
+        };
+        let blocks = std::mem::take(&mut process.inject_at_exit);
+        if !blocks.is_empty() {
+            process.start_injection(tracer, pid, blocks);
+        }
+    }
+
+    /// A process stopped on a signal. Returns the signals to deliver instead,
+    /// or `None` when the stop is not part of an injected free (P5).
+    pub fn injected_stop<T: Tracer>(
+        &mut self,
+        tracer: &mut T,
+        pid: Pid,
+        signal: Signal,
+    ) -> Option<Vec<Signal>> {
+        self.states
+            .get_mut(&pid)?
+            .injected_stop(tracer, pid, signal)
     }
 
     /// A process forked. Its ring is drained and checked first. The child copies
@@ -338,6 +594,21 @@ fn shares_memory<T: Tracer>(tracer: &mut T, pid: Pid, nr: i64) -> bool {
         Ok(regs.rdi)
     };
     flags.map_or(true, |flags| flags & CLONE_VM != 0)
+}
+
+/// Whether a signal means that the injected code itself faulted.
+fn is_fault(signal: Signal) -> bool {
+    matches!(
+        signal,
+        Signal::SIGSEGV | Signal::SIGBUS | Signal::SIGILL | Signal::SIGFPE | Signal::SIGABRT
+    )
+}
+
+/// The words from `rsp` upwards, which the R37 check reads.
+fn read_stack<T: Tracer>(tracer: &mut T, pid: Pid, rsp: u64) -> io::Result<Vec<u64>> {
+    let bytes = tracer.read_mem(pid, rsp, STACK_WORDS * 8)?;
+    let (words, _) = bytes.as_chunks::<8>();
+    Ok(words.iter().map(|word| u64::from_le_bytes(*word)).collect())
 }
 
 fn read_word<T: Tracer>(tracer: &mut T, pid: Pid, addr: u64) -> io::Result<u64> {

@@ -212,6 +212,48 @@ fn static_binary_reports_only_the_block_nothing_points_to() {
     assert!(!log.contains("R40"), "log:\n{log}");
 }
 
+/// The fixture leaks a batch of 70 blocks, then another batch. The check at the
+/// first `mmap` holds the first batch's unreached blocks, and the check at the
+/// second `mmap` confirms them, so they are freed at that call's exit.
+/// `mallinfo2` is glibc's own bookkeeping, not an exact byte count (tcache and
+/// top-chunk merging move it), so the test asserts a lower bound. The block that
+/// `sink` holds must keep its bytes. Without leakgc nothing is freed, so the
+/// drop is zero.
+#[test]
+fn static_binary_gets_its_unreached_blocks_freed_at_a_memory_call() {
+    let fixture = build_c(
+        "leak_free_static.c",
+        &["-static", "-no-pie", "-O0", "-fno-builtin"],
+    );
+    let path = fixture.to_str().expect("UTF-8 path");
+
+    let native = Command::new(&fixture).output().expect("run native");
+    let native_log = String::from_utf8_lossy(&native.stderr);
+    assert_eq!(native.status.code(), Some(0), "log:\n{native_log}");
+    assert_eq!(drop_bytes(&native_log), 0, "log:\n{native_log}");
+    assert!(native_log.contains("live ok"), "log:\n{native_log}");
+
+    let (status, log) = run_leakgc(&[path], &[("LEAKGC_LOG", "1")]);
+
+    assert_eq!(status.code(), Some(0), "log:\n{log}");
+    assert!(drop_bytes(&log) >= 40_000, "log:\n{log}");
+    assert!(log.contains("live ok"), "log:\n{log}");
+    assert!(log.contains("by injected free calls"), "log:\n{log}");
+}
+
+/// The bytes freed, from the fixture's `drop` line.
+fn drop_bytes(log: &str) -> u64 {
+    let line = log
+        .lines()
+        .find(|line| line.starts_with("drop "))
+        .expect("the fixture reports its drop");
+    line.split_whitespace()
+        .nth(1)
+        .expect("a drop value")
+        .parse()
+        .expect("a numeric drop")
+}
+
 #[test]
 fn background_jobs_are_waited_for() {
     let (status, _) = run_leakgc(&["sh", "-c", "sleep 0.1 & wait"], &[]);

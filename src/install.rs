@@ -49,8 +49,8 @@ const BLOCK_LEN: u64 = 0x200;
 const DISPLACED_OFFSET: u64 = 0x1c0;
 /// Where the injection trampoline goes, after the exit stub. Its code is padded
 /// to `INJECT_LEN`, which ends before the ring head.
-const INJECT_OFFSET: u64 = 0x1800;
-const INJECT_LEN: u64 = 0x400;
+pub const INJECT_OFFSET: u64 = 0x1800;
+pub const INJECT_LEN: u64 = 0x400;
 /// Bytes below the stack pointer that the trampoline saves FP and vector state
 /// into. The window covers the largest XSAVE area in use, AMX at about 11 KiB.
 const SAVE_LEN: i32 = 0x4000;
